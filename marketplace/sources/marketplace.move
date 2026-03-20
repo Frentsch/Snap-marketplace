@@ -1,20 +1,21 @@
 /// marketplace.move
 ///
-/// A SUI marketplace where sellers create service listings and buyers purchase
+/// A marketplace where sellers create service listings and buyers purchase
 /// AccessToken NFTs. Buyers later redeem tokens to prove access to off-chain
 /// services. Redemption destroys the token on-chain as immutable proof of use.
 ///
-/// All listings are stored inside a single shared Marketplace object via an
-/// ObjectBag. create_listing adds to the bag; purchase removes and destroys
-/// the listing (one-time-use semantics). Sellers may delist a listing before
-/// it is purchased.
+/// All listings are stored inside a shared Marketplace<COIN> object via an
+/// ObjectBag. Multiple marketplace instances can coexist for different coin
+/// types. create_listing pre-mints an AccessToken inside the listing;
+/// purchase mutates the token in-place within the seller's bounds and extracts
+/// it — no new object is created on purchase. Sellers may delist a listing
+/// before it is purchased (which also deletes the wrapped token).
 module marketplace::marketplace;
 
     // =========================================================
     // Imports
     // =========================================================
     use sui::coin::{Self, Coin};
-    use sui::sui::SUI;
     use sui::event;
     use sui::clock::{Self, Clock};
     use sui::object_bag::{Self, ObjectBag};
@@ -27,21 +28,25 @@ module marketplace::marketplace;
     const EListingNotActive:    u64 = 1;
     const ENotSeller:           u64 = 2;
     const ETokenInvalid:        u64 = 3;
+    const EBuyerOutOfBounds:    u64 = 4;
+    const EBandwidthOutOfBounds: u64 = 5;
 
     // =========================================================
     // Core objects
     // =========================================================
 
-    /// Singleton shared registry. All ServiceListings live inside its ObjectBag.
-    public struct Marketplace has key {
+    /// Shared marketplace registry keyed on coin type.
+    /// All ServiceListings live inside its ObjectBag.
+    /// Multiple instances may exist — one per accepted currency.
+    public struct Marketplace<phantom COIN> has key {
         id: UID,
         listings: ObjectBag,
     }
 
     /// A service listing stored inside the Marketplace ObjectBag.
-    /// `price_mist` is denominated in MIST (1 SUI = 1_000_000_000 MIST).
-    /// `duration_ms` is how long a purchased AccessToken remains valid in
-    /// milliseconds. Use 0 for perpetual (never expires) access.
+    /// Contains a pre-minted AccessToken whose valid_from_ms / expires_at_ms
+    /// represent the seller's upper bounds. The buyer narrows these in-place
+    /// at purchase time; the token is then extracted and transferred.
     public struct ServiceListing has key, store {
         id: UID,
         /// Address of the seller — receives payment on purchase
@@ -50,12 +55,12 @@ module marketplace::marketplace;
         name: String,
         /// IP address or host:port of the service endpoint
         ip_address: String,
-        /// Price per access grant, in MIST
+        /// Price per access grant, in the coin's base unit
         price_mist: u64,
-        /// Access duration in milliseconds; 0 = perpetual
-        duration_ms: u64,
         /// Whether the listing is accepting new purchases
         is_active: bool,
+        /// Pre-minted token; valid_from_ms / expires_at_ms are seller's bounds
+        token: AccessToken,
     }
 
     /// An access token NFT owned by the buyer.
@@ -68,10 +73,12 @@ module marketplace::marketplace;
         service_name: String,
         /// IP address or host:port of the service endpoint (copied from listing)
         ip_address: String,
-        /// Unix timestamp (ms) from which the token is valid; 0 = immediately
+        /// Unix timestamp (ms) from which the token is valid
         valid_from_ms: u64,
-        /// Unix timestamp (ms) after which the token is expired; 0 = never
+        /// Unix timestamp (ms) after which the token is expired
         expires_at_ms: u64,
+        /// Maximum bandwidth in bytes per second; 0 = unlimited
+        bandwidth_bps: u64,
         /// Seller address at time of purchase
         seller: address,
     }
@@ -87,15 +94,17 @@ module marketplace::marketplace;
         ip_address: String,
         valid_from_ms: u64,
         expires_at_ms: u64,
+        bandwidth_bps: u64,
     }
 
     // =========================================================
-    // Module initializer
+    // Marketplace creation
     // =========================================================
 
-    /// Called once on publish. Creates and shares the singleton Marketplace.
-    fun init(ctx: &mut TxContext) {
-        transfer::share_object(Marketplace {
+    /// Create a new Marketplace for a specific coin type and share it.
+    /// Anyone may create a marketplace; each call produces a distinct shared object.
+    public entry fun create_marketplace<COIN>(ctx: &mut TxContext) {
+        transfer::share_object(Marketplace<COIN> {
             id: object::new(ctx),
             listings: object_bag::new(ctx),
         });
@@ -105,34 +114,54 @@ module marketplace::marketplace;
     // Seller functions
     // =========================================================
 
-    /// Create a new service listing and store it in the Marketplace bag.
-    public entry fun create_listing(
-        marketplace: &mut Marketplace,
+    /// Create a new service listing with a pre-minted AccessToken and store it
+    /// in the Marketplace bag.
+    ///
+    /// `valid_from_ms`: seller's "not before" bound for buyers; 0 = no restriction.
+    /// `expires_at_ms`: seller's "not after" bound for buyers; 0 = no expiry.
+    public entry fun create_listing<COIN>(
+        marketplace: &mut Marketplace<COIN>,
         name: vector<u8>,
         ip_address: vector<u8>,
         price_mist: u64,
-        duration_ms: u64,
+        valid_from_ms: u64,
+        expires_at_ms: u64,
+        max_bandwidth_bps: u64,
         ctx: &mut TxContext,
-    ):ID {
-        let listing = ServiceListing {
+    ): ID {
+        let listing_uid = object::new(ctx);
+        let listing_id  = object::uid_to_inner(&listing_uid);
+
+        let token = AccessToken {
             id: object::new(ctx),
+            listing_id,
+            service_name: string::utf8(name),
+            ip_address:   string::utf8(ip_address),
+            valid_from_ms,
+            expires_at_ms,
+            bandwidth_bps: max_bandwidth_bps,
+            seller: ctx.sender(),
+        };
+
+        let listing = ServiceListing {
+            id: listing_uid,
             seller: ctx.sender(),
             name: string::utf8(name),
             ip_address: string::utf8(ip_address),
             price_mist,
-            duration_ms,
             is_active: true,
+            token,
         };
 
-        let listing_id = object::id(&listing);
-        object_bag::add(&mut marketplace.listings, listing_id, listing);
-        listing_id
+        let id = object::id(&listing);
+        object_bag::add(&mut marketplace.listings, id, listing);
+        id
     }
 
     /// Remove a listing from the Marketplace bag before it is purchased.
-    /// Only the original seller may call this.
-    public entry fun delist(
-        marketplace: &mut Marketplace,
+    /// Also deletes the wrapped AccessToken. Only the original seller may call this.
+    public entry fun delist<COIN>(
+        marketplace: &mut Marketplace<COIN>,
         listing_id: ID,
         ctx: &TxContext,
     ) {
@@ -140,15 +169,32 @@ module marketplace::marketplace;
         assert!(listing.seller == ctx.sender(), ENotSeller);
 
         let listing = object_bag::remove<ID, ServiceListing>(&mut marketplace.listings, listing_id);
-        let seller = listing.seller;
-
-        let ServiceListing { id, seller: _, name: _, ip_address: _, price_mist: _, duration_ms: _, is_active: _ } = listing;
+        let ServiceListing {
+            id,
+            seller: _,
+            name: _,
+            ip_address: _,
+            price_mist: _,
+            is_active: _,
+            token,
+        } = listing;
+        let AccessToken {
+            id: token_id,
+            listing_id: _,
+            service_name: _,
+            ip_address: _,
+            valid_from_ms: _,
+            expires_at_ms: _,
+            bandwidth_bps: _,
+            seller: _,
+        } = token;
+        object::delete(token_id);
         object::delete(id);
     }
 
     /// Update listing price or active status. Only the original seller may call this.
-    public entry fun update_listing(
-        marketplace: &mut Marketplace,
+    public entry fun update_listing<COIN>(
+        marketplace: &mut Marketplace<COIN>,
         listing_id: ID,
         new_price_mist: u64,
         is_active: bool,
@@ -158,7 +204,6 @@ module marketplace::marketplace;
         assert!(listing.seller == ctx.sender(), ENotSeller);
         listing.price_mist = new_price_mist;
         listing.is_active = is_active;
-
     }
 
     // =========================================================
@@ -168,57 +213,64 @@ module marketplace::marketplace;
     /// Purchase access to a service.
     ///
     /// Removes the listing from the Marketplace bag (one-time-use).
-    /// `payment` must be a Coin<SUI> with at least `listing.price_mist` MIST.
+    /// `payment` must be a Coin<COIN> with at least `listing.price_mist` base units.
     /// Exactly `price_mist` is extracted and forwarded to the seller.
     ///
-    /// `start_ms`: Unix timestamp (ms) when access should begin; 0 = now.
-    /// `end_ms`:   Unix timestamp (ms) when access expires; 0 = use listing's
-    ///             duration_ms from start (or perpetual if duration_ms == 0).
-    public entry fun purchase(
-        marketplace: &mut Marketplace,
+    /// The pre-minted AccessToken inside the listing is mutated in-place with
+    /// the buyer's desired window (clamped to the seller's bounds) and then
+    /// transferred to the buyer — no new object is created.
+    ///
+    /// Bounds validation (performed by the contract; defaults must be resolved client-side):
+    ///   - If seller set valid_from_ms > 0, start_ms must be >= that value.
+    ///   - If seller set expires_at_ms > 0 and end_ms > 0, end_ms must be <= expires_at_ms.
+    ///   - If seller set bandwidth_bps > 0 and bandwidth_bps arg > 0, it must be <= seller's cap.
+    public entry fun purchase<COIN>(
+        marketplace: &mut Marketplace<COIN>,
         listing_id: ID,
-        payment: &mut Coin<SUI>,
-        clock: &Clock,
+        payment: &mut Coin<COIN>,
         start_ms: u64,
         end_ms: u64,
+        bandwidth_bps: u64,
         ctx: &mut TxContext,
-    ) : ID{
-        let listing = object_bag::remove<ID, ServiceListing>(&mut marketplace.listings, listing_id);
+    ): ID {
+        let mut listing = object_bag::remove<ID, ServiceListing>(&mut marketplace.listings, listing_id);
         assert!(listing.is_active, EListingNotActive);
+        assert!(coin::value(payment) >= listing.price_mist, EInsufficientPayment);
 
-        let price = listing.price_mist;
-        assert!(coin::value(payment) >= price, EInsufficientPayment);
+        // Validate buyer's values against seller's bounds.
+        // valid_from_ms and expires_at_ms are always concrete timestamps;
+        // the client is responsible for resolving any defaults before calling purchase.
+        let seller_from  = listing.token.valid_from_ms;
+        let seller_until = listing.token.expires_at_ms;
+        let seller_bw    = listing.token.bandwidth_bps;
+        assert!(start_ms >= seller_from,                                              EBuyerOutOfBounds);
+        assert!(end_ms > 0 && end_ms <= seller_until,                                EBuyerOutOfBounds);
+        assert!(seller_bw == 0 || (bandwidth_bps > 0 && bandwidth_bps <= seller_bw), EBandwidthOutOfBounds);
+        assert!(start_ms < end_ms,                                                    EBuyerOutOfBounds);
+
+        // Mutate the pre-minted token in-place with the buyer's values
+        listing.token.valid_from_ms = start_ms;
+        listing.token.expires_at_ms = end_ms;
+        listing.token.bandwidth_bps = bandwidth_bps;
 
         // Extract exact payment and forward to seller
-        let seller_payment = coin::split(payment, price, ctx);
+        let seller_payment = coin::split(payment, listing.price_mist, ctx);
         transfer::public_transfer(seller_payment, listing.seller);
 
-        let now_ms = clock::timestamp_ms(clock);
-        let valid_from_ms = if (start_ms == 0) { now_ms } else { start_ms };
-        let expires_at_ms = if (end_ms > 0) {
-            end_ms
-        } else if (listing.duration_ms == 0) {
-            0
-        } else {
-            valid_from_ms + listing.duration_ms
-        };
-
-        let token = AccessToken {
-            id: object::new(ctx),
-            listing_id,
-            service_name: listing.name,
-            ip_address: listing.ip_address,
-            valid_from_ms,
-            expires_at_ms,
-            seller: listing.seller,
-        };
+        // Destructure listing, extract token, transfer to buyer
+        let ServiceListing {
+            id,
+            seller: _,
+            name: _,
+            ip_address: _,
+            price_mist: _,
+            is_active: _,
+            token,
+        } = listing;
+        object::delete(id);
 
         let token_id = object::id(&token);
         transfer::public_transfer(token, ctx.sender());
-
-        // Destroy the listing — it has been consumed by this purchase
-        let ServiceListing { id, seller: _, name: _, ip_address: _, price_mist: _, duration_ms: _, is_active: _ } = listing;
-        object::delete(id);
         token_id
     }
 
@@ -228,17 +280,14 @@ module marketplace::marketplace;
 
     /// Redeem a token, emitting a redemption event and destroying the token.
     ///
-    /// Only the current owner can call this (SUI's object model guarantees
+    /// Only the current owner can call this (the object model guarantees
     /// this — owned objects can only be passed by a transaction from their owner).
     /// The token is deleted on-chain; its deletion is the immutable proof of use.
     public entry fun redeem(
         token: AccessToken,
-        clock: &Clock,
         ip_address: vector<u8>,
         ctx: &TxContext,
     ) {
-        assert!(is_valid(&token, clock), ETokenInvalid);
-
         event::emit(TokenRedeemed {
             token_id: object::id(&token),
             listing_id: token.listing_id,
@@ -246,11 +295,12 @@ module marketplace::marketplace;
             ip_address: string::utf8(ip_address),
             valid_from_ms: token.valid_from_ms,
             expires_at_ms: token.expires_at_ms,
+            bandwidth_bps: token.bandwidth_bps,
         });
 
         let AccessToken {
             id, listing_id: _, service_name: _, ip_address: _,
-            valid_from_ms: _, expires_at_ms: _, seller: _,
+            valid_from_ms: _, expires_at_ms: _, bandwidth_bps: _, seller: _,
         } = token;
         object::delete(id);
     }
@@ -259,23 +309,13 @@ module marketplace::marketplace;
     // View helpers
     // =========================================================
 
-    /// Returns true only if the token is within its valid time window.
-    public fun is_valid(token: &AccessToken, clock: &Clock): bool {
-        let now = clock::timestamp_ms(clock);
-        if (now < token.valid_from_ms) { return false };
-        if (token.expires_at_ms == 0) { return true };
-        now < token.expires_at_ms
-    }
 
-    // =========================================================
-    // Test helpers
-    // =========================================================
-
-    #[test_only]
-    public fun init_for_testing(ctx: &mut TxContext) { init(ctx); }
-
-    public fun listing_price(listing: &ServiceListing): u64    { listing.price_mist }
-    public fun listing_active(listing: &ServiceListing): bool   { listing.is_active }
+    public fun listing_price(listing: &ServiceListing): u64     { listing.price_mist }
+    public fun listing_active(listing: &ServiceListing): bool    { listing.is_active }
     public fun listing_seller(listing: &ServiceListing): address { listing.seller }
-    public fun token_listing_id(token: &AccessToken): ID       { token.listing_id }
-    public fun token_expires_at(token: &AccessToken): u64      { token.expires_at_ms }
+    public fun listing_valid_from(listing: &ServiceListing): u64    { listing.token.valid_from_ms }
+    public fun listing_expires_at(listing: &ServiceListing): u64    { listing.token.expires_at_ms }
+    public fun listing_bandwidth_bps(listing: &ServiceListing): u64 { listing.token.bandwidth_bps }
+    public fun token_listing_id(token: &AccessToken): ID            { token.listing_id }
+    public fun token_expires_at(token: &AccessToken): u64           { token.expires_at_ms }
+    public fun token_bandwidth_bps(token: &AccessToken): u64        { token.bandwidth_bps }

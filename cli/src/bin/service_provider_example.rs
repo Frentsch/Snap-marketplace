@@ -9,8 +9,7 @@ use sui_sdk::{rpc_types::EventFilter, SuiClient, SuiClientBuilder};
 use sui_types::base_types::ObjectID;
 use tokio::{io::AsyncWriteExt, net::TcpListener, sync::RwLock, time::{sleep, Duration}};
 
-// Mirror the constant from marketplace.rs — keep in sync if the package is re-deployed.
-const PACKAGE_ID: &str = "0x7f1c4d5a5a48ec94025deebcff0c570ab086409a4cfd52f4381a1aa08bb7d096";
+use cli::marketplace::PACKAGE_ID;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CLI args
@@ -27,9 +26,17 @@ struct Args {
     #[arg(long, default_value = "0.1")]
     price_sui: f64,
 
-    /// Access duration in hours; 0 = perpetual (default)
+    /// Earliest time buyers may set as their start, as Unix ms timestamp; 0 = now (default)
     #[arg(long, default_value = "0")]
-    duration_hours: f64,
+    valid_from_ms: u64,
+
+    /// Latest time buyers may set as their end, as Unix ms timestamp; 0 = now+1h (default)
+    #[arg(long, default_value = "0")]
+    expires_at_ms: u64,
+
+    /// Maximum bandwidth in bytes per second buyers may request; 0 = unlimited
+    #[arg(long, default_value = "1000")]
+    max_bandwidth_bps: u64,
 
     /// TCP address to listen on for authorization checks
     #[arg(long, default_value = "127.0.0.1:8080")]
@@ -81,6 +88,7 @@ async fn event_loop(
                         println!("Redemption received — authorizing IP: {ip}");
                         authorized.write().await.insert(ip.to_string());
                     }
+                    println!("reserved {} bps from {} to {}", j["bandwidth_bps"],j["valid_from_ms"], j["expires_at_ms"]);
                 }
                 // Advance cursor if the node returned one
                 if page.next_cursor.is_some() {
@@ -144,18 +152,28 @@ async fn tcp_listener_loop(
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    // 1. Create the marketplace listing with ip_address = listen address.
-    println!("Creating marketplace listing '{}'…", args.name);
+    // 1. Resolve 0 → now / now+1h for valid_from_ms / expires_at_ms.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("System clock before UNIX epoch")?
+        .as_millis() as u64;
+    let valid_from_ms  = if args.valid_from_ms  == 0 { now_ms } else { args.valid_from_ms };
+    let expires_at_ms  = if args.expires_at_ms  == 0 { now_ms + 3_600_000 } else { args.expires_at_ms };
+
+    // 2. Create the marketplace listing with ip_address = listen address.
+    println!("Creating marketplace listing '{}' advertising {} bps from {} to {}", args.name,args.max_bandwidth_bps,valid_from_ms, expires_at_ms);
     let listing_id = cli::marketplace::create_listing(
         args.name.clone(),
         args.listen.clone(),
         args.price_sui,
-        args.duration_hours,
+        valid_from_ms,
+        expires_at_ms,
+        args.max_bandwidth_bps,
     )
     .await?;
     println!("Listing ID: {listing_id}");
 
-    // 2. Build an HTTP Sui client for event polling (no WebSocket needed).
+    // 3. Build an HTTP Sui client for event polling (no WebSocket needed).
     let wallet = cli::utils::get_wallet().await?;
     let env = wallet.get_active_env()?;
     let client = SuiClientBuilder::default()
@@ -163,12 +181,12 @@ async fn main() -> Result<()> {
         .await
         .context("Failed to build Sui client")?;
 
-    // 3. Shared authorized-IP set.
+    // 4. Shared authorized-IP set.
     let authorized: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
 
-    // 4. Spawn event polling in the background.
+    // 5. Spawn event polling in the background.
     tokio::spawn(event_loop(client, listing_id, authorized.clone()));
 
-    // 5. Run TCP listener (blocks until error).
+    // 6. Run TCP listener (blocks until error).
     tcp_listener_loop(&args.listen, authorized).await
 }

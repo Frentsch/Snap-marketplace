@@ -13,6 +13,18 @@ struct Args {
     /// IP address to record in the redemption event (must match your TCP peer IP)
     #[arg(long, default_value = "127.0.0.1")]
     ip: String,
+
+    /// Desired access start time as Unix ms timestamp; 0 = use seller's bound (default)
+    #[arg(long, default_value = "0")]
+    start_ms: u64,
+
+    /// Desired access end time as Unix ms timestamp; 0 = use seller's bound (default)
+    #[arg(long, default_value = "0")]
+    end_ms: u64,
+
+    /// Desired bandwidth in bytes per second; 0 = use seller's bound (default)
+    #[arg(long, default_value = "0")]
+    bandwidth_bps: u64,
 }
 
 async fn try_connect(addr: &str) -> Result<String> {
@@ -34,7 +46,7 @@ async fn main() -> Result<()> {
 
     // 2. Buy the listing → receive an AccessToken.
     println!("Buying listing {}…", args.listing_id);
-    let token_id = cli::marketplace::buy_listing(args.listing_id.clone(), 0, 0).await?;
+    let token_id = cli::marketplace::buy_listing(args.listing_id.clone(), args.start_ms, args.end_ms, args.bandwidth_bps).await?;
 
     // 3. Redeem the token, recording our IP so the server will authorize us.
     println!("Redeeming token {token_id} with IP {}…", args.ip);

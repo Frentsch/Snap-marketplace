@@ -14,13 +14,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Deploy a new Marketplace shared object for the configured coin type
+    CreateMarketplace {},
+
     /// Create a new service listing on the marketplace
     CreateListing {
         /// Human-readable service name
         #[arg(long)]
         name: String,
 
-        /// URI pointing to off-chain metadata (IPFS, HTTPS, etc.)
+        /// IP address or host:port of the service endpoint
         #[arg(long)]
         ip_address: String,
 
@@ -28,9 +31,17 @@ enum Commands {
         #[arg(long)]
         price_sui: f64,
 
-        /// Access duration in hours; use 0 for perpetual
+        /// Earliest time buyers may set as their start, as Unix ms timestamp; 0 = no restriction
         #[arg(long, default_value = "0")]
-        duration_hours: f64,
+        valid_from_ms: u64,
+
+        /// Latest time buyers may set as their end, as Unix ms timestamp; 0 = no expiry
+        #[arg(long, default_value = "0")]
+        expires_at_ms: u64,
+
+        /// Maximum bandwidth in bytes per second buyers may request; 0 = unlimited
+        #[arg(long, default_value = "0")]
+        max_bandwidth_bps: u64,
     },
 
     /// Display existing service listings
@@ -49,9 +60,13 @@ enum Commands {
         #[arg(long)]
         start_date: Option<String>,
 
-        /// Datetime when access expires, "YYYY-MM-DD HH:MM:SS" UTC (default: derived from listing duration)
+        /// Datetime when access expires, "YYYY-MM-DD HH:MM:SS" UTC (default: seller's bound)
         #[arg(long)]
         end_date: Option<String>,
+
+        /// Desired bandwidth in bytes per second; 0 = keep seller's max (default: 0)
+        #[arg(long, default_value = "0")]
+        bandwidth_bps: u64,
     },
 
     /// Redeem an access token
@@ -87,8 +102,12 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::CreateListing { name, ip_address, price_sui, duration_hours } => {
-            marketplace::create_listing(name, ip_address, price_sui, duration_hours).await?;
+        Commands::CreateMarketplace {} => {
+            marketplace::create_marketplace().await?;
+        }
+
+        Commands::CreateListing { name, ip_address, price_sui, valid_from_ms, expires_at_ms, max_bandwidth_bps } => {
+            marketplace::create_listing(name, ip_address, price_sui, valid_from_ms, expires_at_ms, max_bandwidth_bps).await?;
             // listing ID is printed inside create_listing
         }
 
@@ -96,10 +115,10 @@ async fn main() -> Result<()> {
             marketplace::get_listings(limit).await?;
         }
 
-        Commands::BuyListing { listing_id, start_date, end_date } => {
+        Commands::BuyListing { listing_id, start_date, end_date, bandwidth_bps } => {
             let start_ms = start_date.as_deref().map(parse_date_ms).transpose()?.unwrap_or(0);
             let end_ms   = end_date.as_deref().map(parse_date_ms).transpose()?.unwrap_or(0);
-            marketplace::buy_listing(listing_id, start_ms, end_ms).await?;
+            marketplace::buy_listing(listing_id, start_ms, end_ms, bandwidth_bps).await?;
         }
 
         Commands::Redeem { token_id, ip_address } => {
