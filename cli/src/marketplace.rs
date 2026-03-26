@@ -17,9 +17,9 @@ use sui_types::{
 };
 use serde_json::Value;
 
-pub const PACKAGE_ID: &str = "0xe945b8a41c5cad288dfc3a7796c9088bec6eaa92a876f0c5b1bcee92f45a8c83";
+pub const PACKAGE_ID: &str = "0x16c820f39b159f91a10acb9dcf2e9b12b3d1ba855b7f49d9221574b44fa3cd91";
 // Fill in after publishing the updated contract:
-const MARKETPLACE_ID: &str = "0x5c14e991378d179d13b585a7159ac20af1b7246155585ad7b4010fe6e32cdf8b";
+const MARKETPLACE_ID: &str = "0x6105d1937ce316c44aa02e2da7a4e6e621605e9b97e2280d0513998a6f540d99";
 /// Coin type accepted by MARKETPLACE_ID. Update alongside MARKETPLACE_ID.
 const COIN_TYPE: &str = "0x2::sui::SUI";
 const GAS_BUDGET: u64 = 50_000_000; // 0.05 SUI
@@ -313,6 +313,10 @@ pub async fn create_listing(
     valid_from_ms: u64,
     expires_at_ms: u64,
     max_bandwidth_bps: u64,
+    min_bandwidth_bps: u64,
+    min_duration_ms: u64,
+    bw_granularity: u64,
+    time_granularity: u64,
 ) -> Result<ObjectID> {
     let mut wallet = get_wallet().await?;
     let price_mist = (price_sui * 1_000_000_000.0) as u64;
@@ -325,7 +329,6 @@ pub async fn create_listing(
         Identifier::new("create_listing")?,
         vec![coin_type_tag()?],
         vec![
-            // &mut Marketplace (shared mutable)
             marketplace_arg(&client).await?,
             CallArg::Pure(bcs::to_bytes(name.as_bytes())?),
             CallArg::Pure(bcs::to_bytes(ip_address.as_bytes())?),
@@ -333,24 +336,30 @@ pub async fn create_listing(
             CallArg::Pure(bcs::to_bytes(&valid_from_ms)?),
             CallArg::Pure(bcs::to_bytes(&expires_at_ms)?),
             CallArg::Pure(bcs::to_bytes(&max_bandwidth_bps)?),
+            CallArg::Pure(bcs::to_bytes(&min_bandwidth_bps)?),
+            CallArg::Pure(bcs::to_bytes(&min_duration_ms)?),
+            CallArg::Pure(bcs::to_bytes(&bw_granularity)?),
+            CallArg::Pure(bcs::to_bytes(&time_granularity)?),
         ],
     )?;
 
     let tx_data = build_tx_data(&client, &mut wallet, ptb).await?;
     let response = sign_and_execute(&client, &wallet, tx_data).await?;
-    // Both ServiceListing and its wrapped AccessToken are created in this tx.
-    // Filter by type name to unambiguously get the ServiceListing's ID.
     let listing_id = get_created_object_id_by_type(&response, "ServiceListing")?;
     let digest = response.digest.to_string();
 
     println!("Listing created!");
-    println!("  Listing:      {listing_id}");
-    println!("  Name:         {name}");
-    println!("  Price:        {price_sui} SUI");
-    println!("  Valid from:   {}", if valid_from_ms == 0 { "now".into() } else { format!("{valid_from_ms} ms") });
-    println!("  Expires at:   {}", if expires_at_ms == 0 { "never".into() } else { format!("{expires_at_ms} ms") });
-    println!("  Max BW:       {}", if max_bandwidth_bps == 0 { "unlimited".into() } else { format!("{max_bandwidth_bps} B/s") });
-    println!("  Tx:           {digest}");
+    println!("  Listing:        {listing_id}");
+    println!("  Name:           {name}");
+    println!("  Price:          {price_sui} SUI");
+    println!("  Valid from:     {valid_from_ms} ms");
+    println!("  Expires at:     {expires_at_ms} ms");
+    println!("  Max BW:         {}", if max_bandwidth_bps == 0 { "unlimited".into() } else { format!("{max_bandwidth_bps} B/s") });
+    println!("  Min BW:         {}", if min_bandwidth_bps == 0 { "none".into() } else { format!("{min_bandwidth_bps} B/s") });
+    println!("  Min duration:   {}", if min_duration_ms   == 0 { "none".into() } else { format!("{min_duration_ms} ms") });
+    println!("  BW granularity: {}", if bw_granularity    == 0 { "any".into()  } else { format!("{bw_granularity} B/s") });
+    println!("  Time gran.:     {}", if time_granularity  == 0 { "any".into()  } else { format!("{time_granularity} ms") });
+    println!("  Tx:             {digest}");
     Ok(listing_id)
 }
 
@@ -424,6 +433,144 @@ pub async fn get_listings(limit: u32) -> Result<()> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// search_listings
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Search listings by subnet, minimum bandwidth, and time window.
+///
+/// Fetches all listings from the marketplace, applies filters, then displays
+/// results sorted by increasing price.
+///
+/// - `subnet`:            only show listings whose IP is contained in this subnet
+/// - `min_bandwidth_bps`: only show listings offering at least this bandwidth (0 = any)
+/// - `start_ms`:          only show listings available at/before this timestamp (0 = skip)
+/// - `end_ms`:            only show listings valid at/after this timestamp (0 = skip)
+pub async fn search_listings(
+    subnet: &str,
+    min_bandwidth_bps: u64,
+    start_ms: u64,
+    end_ms: u64,
+) -> Result<()> {
+    use ipnet::IpNet;
+    use std::net::IpAddr;
+    use std::str::FromStr;
+
+    let filter_net: IpNet = subnet.parse()
+        .with_context(|| format!("Invalid subnet '{subnet}'"))?;
+
+    let wallet = get_wallet().await?;
+    let client = rpc_client(&wallet).await?;
+    let marketplace_id = ObjectID::from_str(MARKETPLACE_ID)?;
+
+    let marketplace_fields = get_move_fields(&client, marketplace_id).await?;
+    let bag_id_str = marketplace_fields["listings"]["fields"]["id"]["id"]
+        .as_str()
+        .context("Could not find listings ObjectBag ID")?;
+    let bag_id = ObjectID::from_str(bag_id_str)?;
+
+    // Paginate through all listings
+    let mut all_field_ids: Vec<ObjectID> = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = client
+            .read_api()
+            .get_dynamic_fields(bag_id, cursor, Some(50))
+            .await?;
+        all_field_ids.extend(page.data.iter().map(|f| f.object_id));
+        if page.has_next_page {
+            cursor = page.next_cursor;
+        } else {
+            break;
+        }
+    }
+
+    if all_field_ids.is_empty() {
+        println!("No listings found.");
+        return Ok(());
+    }
+
+    let objects = client
+        .read_api()
+        .multi_get_object_with_options(all_field_ids, SuiObjectDataOptions::new().with_content())
+        .await?;
+
+    struct ListingRow {
+        id: String,
+        name: String,
+        price_mist: u64,
+        price_sui: f64,
+        ip_address: String,
+        valid_from_ms: u64,
+        expires_at_ms: u64,
+        bandwidth_bps: u64,
+    }
+
+    let mut rows: Vec<ListingRow> = Vec::new();
+
+    for obj_resp in &objects {
+        let Some(data) = &obj_resp.data else { continue };
+        let Some(SuiParsedData::MoveObject(move_obj)) = &data.content else { continue };
+        let f = serde_json::to_value(&move_obj.fields)?;
+
+        let ip_str   = f["ip_address"].as_str().unwrap_or("").to_string();
+        let bw: u64  = f["token"]["fields"]["bandwidth_bps"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let from: u64 = f["token"]["fields"]["valid_from_ms"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let until: u64 = f["token"]["fields"]["expires_at_ms"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let price_mist: u64 = f["price_mist"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
+
+        // Subnet filter: strip port if present, then check containment
+        let host_str = ip_str.rsplit_once(':').map(|(h, _)| h).unwrap_or(&ip_str);
+        if let Ok(ip) = IpAddr::from_str(host_str) {
+            if !filter_net.contains(&ip) {
+                continue;
+            }
+        }
+        // Bandwidth filter
+        if min_bandwidth_bps > 0 && bw < min_bandwidth_bps {
+            continue;
+        }
+        // Start filter: listing must be available at or before the requested start
+        if start_ms > 0 && from > start_ms {
+            continue;
+        }
+        // End filter: listing must stay valid at or after the requested end
+        if end_ms > 0 && until < end_ms {
+            continue;
+        }
+
+        rows.push(ListingRow {
+            id: data.object_id.to_string(),
+            name: f["name"].as_str().unwrap_or("?").to_string(),
+            price_mist,
+            price_sui: price_mist as f64 / 1e9,
+            ip_address: ip_str,
+            valid_from_ms: from,
+            expires_at_ms: until,
+            bandwidth_bps: bw,
+        });
+    }
+
+    if rows.is_empty() {
+        println!("No listings match the given filters.");
+        return Ok(());
+    }
+
+    rows.sort_by_key(|r| r.price_mist);
+
+    println!("{:<68}  {:>10}  {:<20}  {}", "Listing ID", "Price SUI", "IP", "Name");
+    println!("{}", "─".repeat(120));
+    for r in &rows {
+        let bw_str = if r.bandwidth_bps == 0 { "unlimited".to_string() } else { format!("{} B/s", r.bandwidth_bps) };
+        println!(
+            "{:<68}  {:>10.4}  {:<20}  {}  (from: {}, until: {}, bw: {})",
+            r.id, r.price_sui, r.ip_address, r.name, r.valid_from_ms, r.expires_at_ms, bw_str
+        );
+    }
+    println!("\n{} listing(s) found.", rows.len());
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // buy_listing
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -445,11 +592,17 @@ pub async fn buy_listing(
         .duration_since(std::time::UNIX_EPOCH)?
         .as_millis() as u64;
     let resolved_start = if start_ms == 0 { now_ms } else { start_ms };
-    let resolved_end: u64 = if end_ms == 0 {
+    let mut resolved_end: u64 = if end_ms == 0 {
         listing_fields["token"]["fields"]["expires_at_ms"]
             .as_str().and_then(|s| s.parse().ok())
             .context("expires_at_ms missing from listing")?
     } else { end_ms };
+    //align end_ms to fit granularity
+    let granularity: u64 = listing_fields["time_granularity"].as_str().and_then(|s| s.parse().ok()).context("No granularity set")?;
+    if (resolved_end-resolved_start)%granularity !=0 {
+        resolved_end = resolved_end - ((resolved_end-resolved_start)%granularity);
+    }
+
     let resolved_bw: u64 = if bandwidth_bps == 0 {
         listing_fields["token"]["fields"]["bandwidth_bps"]
             .as_str().and_then(|s| s.parse().ok()).unwrap_or(0)

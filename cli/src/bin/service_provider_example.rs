@@ -1,7 +1,6 @@
 /// service_provider — registers a listing on the marketplace, polls for
 /// TokenRedeemed events, and gates TCP connections by the redeemer's IP.
 use anyhow::{Context, Result};
-use futures::stream::StreamExt;
 use clap::Parser;
 use move_core_types::identifier::Identifier;
 use std::{collections::HashSet, str::FromStr, sync::Arc};
@@ -18,12 +17,16 @@ use cli::marketplace::PACKAGE_ID;
 #[derive(Parser)]
 #[command(name = "service-provider", about = "Marketplace service provider server")]
 struct Args {
+    /// Use secondary (not active) address for local testing
+    #[arg(short = 's', long )]
+    secondary: bool,
+
     /// Human-readable service name shown in the marketplace listing
     #[arg(long, default_value = "Test Server")]
     name: String,
 
     /// Price per access grant in SUI (e.g. 0.1)
-    #[arg(long, default_value = "0.1")]
+    #[arg(long, default_value = "0.01")]
     price_sui: f64,
 
     /// Earliest time buyers may set as their start, as Unix ms timestamp; 0 = now (default)
@@ -34,9 +37,25 @@ struct Args {
     #[arg(long, default_value = "0")]
     expires_at_ms: u64,
 
-    /// Maximum bandwidth in bytes per second buyers may request; 0 = unlimited
-    #[arg(long, default_value = "1000")]
+    /// Maximum bandwidth in bytes per second buyers may request
+    #[arg(long, default_value = "10000")]
     max_bandwidth_bps: u64,
+
+    /// Minimum bandwidth buyers must purchase in B/s
+    #[arg(long, default_value = "1000")]
+    min_bandwidth_bps: u64,
+
+    /// Minimum duration buyers must purchase in ms
+    #[arg(long, default_value = "1000")]
+    min_duration_ms: u64,
+
+    /// Bandwidth granularity in B/s
+    #[arg(long, default_value = "1000")]
+    bw_granularity: u64,
+
+    /// Time granularity in ms
+    #[arg(long, default_value = "10000")]
+    time_granularity: u64,
 
     /// TCP address to listen on for authorization checks
     #[arg(long, default_value = "127.0.0.1:8080")]
@@ -49,11 +68,9 @@ struct Args {
 
 async fn event_loop(
     client: SuiClient,
-    listing_id: ObjectID,
+    issuer: String,
     authorized: Arc<RwLock<HashSet<String>>>,
 ) -> Result<()>{
-    let listing_id_hex = listing_id.to_string();
-
     let filter = match (|| -> Result<EventFilter> {
         Ok(EventFilter::MoveEventModule {
             package: ObjectID::from_str(PACKAGE_ID)?,
@@ -67,7 +84,7 @@ async fn event_loop(
         }
     };
 
-    println!("Polling marketplace events every 3s, watching listing {listing_id_hex}");
+    println!("Polling marketplace events every 3s, watching redemptions for issuer {issuer}");
 
     // Manually poll query_events with a moving cursor so we catch events
     // emitted after startup. get_events_stream only drains existing events
@@ -81,7 +98,7 @@ async fn event_loop(
                         continue;
                     }
                     let j = &event.parsed_json;
-                    if j["listing_id"].as_str().unwrap_or("") != listing_id_hex {
+                    if j["issuer"].as_str().unwrap_or("") != issuer {
                         continue;
                     }
                     if let Some(ip) = j["ip_address"].as_str() {
@@ -159,9 +176,16 @@ async fn main() -> Result<()> {
         .as_millis() as u64;
     let valid_from_ms  = if args.valid_from_ms  == 0 { now_ms } else { args.valid_from_ms };
     let expires_at_ms  = if args.expires_at_ms  == 0 { now_ms + 3_600_000 } else { args.expires_at_ms };
+    let duration_ms    = expires_at_ms - valid_from_ms;
+
+    // Resolve 0 → tenth of max for the constraint fields.
+    let min_bandwidth_bps = if args.min_bandwidth_bps == 0 { args.max_bandwidth_bps / 10 } else { args.min_bandwidth_bps };
+    let bw_granularity    = if args.bw_granularity    == 0 { args.max_bandwidth_bps / 10 } else { args.bw_granularity };
+    let min_duration_ms   = if args.min_duration_ms   == 0 { duration_ms / 10 }            else { args.min_duration_ms };
+    let time_granularity  = if args.time_granularity  == 0 { duration_ms / 10 }            else { args.time_granularity };
 
     // 2. Create the marketplace listing with ip_address = listen address.
-    println!("Creating marketplace listing '{}' advertising {} bps from {} to {}", args.name,args.max_bandwidth_bps,valid_from_ms, expires_at_ms);
+    println!("Creating marketplace listing '{}' advertising {} bps from {} to {}", args.name, args.max_bandwidth_bps, valid_from_ms, expires_at_ms);
     let listing_id = cli::marketplace::create_listing(
         args.name.clone(),
         args.listen.clone(),
@@ -169,12 +193,17 @@ async fn main() -> Result<()> {
         valid_from_ms,
         expires_at_ms,
         args.max_bandwidth_bps,
+        min_bandwidth_bps,
+        min_duration_ms,
+        bw_granularity,
+        time_granularity,
     )
     .await?;
     println!("Listing ID: {listing_id}");
 
     // 3. Build an HTTP Sui client for event polling (no WebSocket needed).
-    let wallet = cli::utils::get_wallet().await?;
+    let mut wallet = cli::utils::get_wallet().await?;
+    let issuer = wallet.active_address()?.to_string();
     let env = wallet.get_active_env()?;
     let client = SuiClientBuilder::default()
         .build(&env.rpc)
@@ -185,7 +214,7 @@ async fn main() -> Result<()> {
     let authorized: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
 
     // 5. Spawn event polling in the background.
-    tokio::spawn(event_loop(client, listing_id, authorized.clone()));
+    tokio::spawn(event_loop(client, issuer, authorized.clone()));
 
     // 6. Run TCP listener (blocks until error).
     tcp_listener_loop(&args.listen, authorized).await

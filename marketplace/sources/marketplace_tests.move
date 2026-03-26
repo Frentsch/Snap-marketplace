@@ -305,7 +305,7 @@ module marketplace::marketplace_tests;
     // Test 9: buyer out-of-bounds end_ms is rejected
     // =========================================================
     #[test]
-    #[expected_failure(abort_code = marketplace::EBuyerOutOfBounds)]
+    #[expected_failure(abort_code = marketplace::EInvalidInterval)]
     fun test_buyer_out_of_bounds() {
         let mut scenario = test_scenario::begin(SELLER);
         setup(&mut scenario);
@@ -355,7 +355,7 @@ module marketplace::marketplace_tests;
     // Test 10: buyer out-of-bounds bandwidth is rejected
     // =========================================================
     #[test]
-    #[expected_failure(abort_code = marketplace::EBandwidthOutOfBounds)]
+    #[expected_failure(abort_code = marketplace::EInvalidBandwidth)]
     fun test_bandwidth_out_of_bounds() {
         let mut scenario = test_scenario::begin(SELLER);
         setup(&mut scenario);

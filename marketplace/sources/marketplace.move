@@ -24,12 +24,14 @@ module marketplace::marketplace;
     // =========================================================
     // Error codes
     // =========================================================
-    const EInsufficientPayment: u64 = 0;
-    const EListingNotActive:    u64 = 1;
-    const ENotSeller:           u64 = 2;
-    const ETokenInvalid:        u64 = 3;
-    const EBuyerOutOfBounds:    u64 = 4;
-    const EBandwidthOutOfBounds: u64 = 5;
+    const EInsufficientPayment:  u64 = 0;
+    const EListingNotActive:     u64 = 1;
+    const ENotSeller:            u64 = 2;
+    const ETokenInvalid:         u64 = 3; // reserved
+    const EInvalidInterval:      u64 = 4;
+    const EInvalidBandwidth:     u64 = 5;
+    const EInvalidMinBandwidth:  u64 = 6;
+    const EInvalidGranularity:   u64 = 7;
 
     // =========================================================
     // Core objects
@@ -49,8 +51,8 @@ module marketplace::marketplace;
     /// at purchase time; the token is then extracted and transferred.
     public struct ServiceListing has key, store {
         id: UID,
-        /// Address of the seller — receives payment on purchase
-        seller: address,
+        /// Address of the issuer (seller) — receives payment on purchase
+        issuer: address,
         /// Human-readable service name
         name: String,
         /// IP address or host:port of the service endpoint
@@ -59,6 +61,14 @@ module marketplace::marketplace;
         price_mist: u64,
         /// Whether the listing is accepting new purchases
         is_active: bool,
+        /// Minimum bandwidth buyers must purchase; 0 = no minimum
+        min_bandwidth_bps: u64,
+        /// Minimum duration buyers must purchase in ms; 0 = no minimum
+        min_duration_ms: u64,
+        /// Bandwidth must be a multiple of this value; 0 = any value
+        bw_granularity: u64,
+        /// Duration must be a multiple of this value in ms; 0 = any value
+        time_granularity: u64,
         /// Pre-minted token; valid_from_ms / expires_at_ms are seller's bounds
         token: AccessToken,
     }
@@ -77,10 +87,10 @@ module marketplace::marketplace;
         valid_from_ms: u64,
         /// Unix timestamp (ms) after which the token is expired
         expires_at_ms: u64,
-        /// Maximum bandwidth in bytes per second; 0 = unlimited
+        /// Maximum bandwidth in bytes per second
         bandwidth_bps: u64,
-        /// Seller address at time of purchase
-        seller: address,
+        /// Issuer (seller) address at time of purchase
+        issuer: address,
     }
 
     // =========================================================
@@ -89,7 +99,7 @@ module marketplace::marketplace;
 
     public struct TokenRedeemed has copy, drop {
         token_id: ID,
-        listing_id: ID,
+        issuer: address,
         redeemed_by: address,
         ip_address: String,
         valid_from_ms: u64,
@@ -127,8 +137,20 @@ module marketplace::marketplace;
         valid_from_ms: u64,
         expires_at_ms: u64,
         max_bandwidth_bps: u64,
+        min_bandwidth_bps: u64,
+        min_duration_ms: u64,
+        bw_granularity: u64,
+        time_granularity: u64,
         ctx: &mut TxContext,
     ): ID {
+        // Validate granularity and minimum constraints against the seller's own bounds.
+        // All constraint values must be non-zero; the client is responsible for resolving defaults.
+        let total_duration = expires_at_ms - valid_from_ms;
+        assert!(min_bandwidth_bps != 0 && max_bandwidth_bps != 0 && min_bandwidth_bps <= max_bandwidth_bps, EInvalidMinBandwidth);
+        assert!(bw_granularity != 0 && max_bandwidth_bps % bw_granularity == 0, EInvalidGranularity);
+        assert!(time_granularity != 0 && total_duration % time_granularity == 0,                            EInvalidGranularity);
+        assert!(min_duration_ms != 0 && min_duration_ms <= total_duration,                                  EInvalidInterval);
+
         let listing_uid = object::new(ctx);
         let listing_id  = object::uid_to_inner(&listing_uid);
 
@@ -140,16 +162,20 @@ module marketplace::marketplace;
             valid_from_ms,
             expires_at_ms,
             bandwidth_bps: max_bandwidth_bps,
-            seller: ctx.sender(),
+            issuer: ctx.sender(),
         };
 
         let listing = ServiceListing {
             id: listing_uid,
-            seller: ctx.sender(),
+            issuer: ctx.sender(),
             name: string::utf8(name),
             ip_address: string::utf8(ip_address),
             price_mist,
             is_active: true,
+            min_bandwidth_bps,
+            min_duration_ms,
+            bw_granularity,
+            time_granularity,
             token,
         };
 
@@ -166,16 +192,20 @@ module marketplace::marketplace;
         ctx: &TxContext,
     ) {
         let listing = object_bag::borrow<ID, ServiceListing>(&marketplace.listings, listing_id);
-        assert!(listing.seller == ctx.sender(), ENotSeller);
+        assert!(listing.issuer == ctx.sender(), ENotSeller);
 
         let listing = object_bag::remove<ID, ServiceListing>(&mut marketplace.listings, listing_id);
         let ServiceListing {
             id,
-            seller: _,
+            issuer: _,
             name: _,
             ip_address: _,
             price_mist: _,
             is_active: _,
+            min_bandwidth_bps: _,
+            min_duration_ms: _,
+            bw_granularity: _,
+            time_granularity: _,
             token,
         } = listing;
         let AccessToken {
@@ -186,7 +216,7 @@ module marketplace::marketplace;
             valid_from_ms: _,
             expires_at_ms: _,
             bandwidth_bps: _,
-            seller: _,
+            issuer: _,
         } = token;
         object::delete(token_id);
         object::delete(id);
@@ -201,7 +231,7 @@ module marketplace::marketplace;
         ctx: &TxContext,
     ) {
         let listing = object_bag::borrow_mut<ID, ServiceListing>(&mut marketplace.listings, listing_id);
-        assert!(listing.seller == ctx.sender(), ENotSeller);
+        assert!(listing.issuer == ctx.sender(), ENotSeller);
         listing.price_mist = new_price_mist;
         listing.is_active = is_active;
     }
@@ -243,28 +273,37 @@ module marketplace::marketplace;
         let seller_from  = listing.token.valid_from_ms;
         let seller_until = listing.token.expires_at_ms;
         let seller_bw    = listing.token.bandwidth_bps;
-        assert!(start_ms >= seller_from,                                              EBuyerOutOfBounds);
-        assert!(end_ms > 0 && end_ms <= seller_until,                                EBuyerOutOfBounds);
-        assert!(seller_bw == 0 || (bandwidth_bps > 0 && bandwidth_bps <= seller_bw), EBandwidthOutOfBounds);
-        assert!(start_ms < end_ms,                                                    EBuyerOutOfBounds);
+        assert!(start_ms >= seller_from,                                              EInvalidInterval);
+        assert!(end_ms > start_ms && end_ms <= seller_until,                         EInvalidInterval);
+        assert!(seller_bw == 0 || (bandwidth_bps > 0 && bandwidth_bps <= seller_bw), EInvalidBandwidth);
+
+        let duration_ms = end_ms - start_ms;
+        assert!(listing.min_bandwidth_bps != 0 && bandwidth_bps >= listing.min_bandwidth_bps, EInvalidBandwidth);
+        assert!(listing.min_duration_ms   != 0 && duration_ms   >= listing.min_duration_ms,   EInvalidInterval);
+        assert!(listing.bw_granularity    != 0 && bandwidth_bps % listing.bw_granularity == 0, EInvalidGranularity);
+        assert!(listing.time_granularity  != 0 && duration_ms   % listing.time_granularity == 0, EInvalidGranularity);
 
         // Mutate the pre-minted token in-place with the buyer's values
         listing.token.valid_from_ms = start_ms;
         listing.token.expires_at_ms = end_ms;
         listing.token.bandwidth_bps = bandwidth_bps;
 
-        // Extract exact payment and forward to seller
+        // Extract exact payment and forward to issuer
         let seller_payment = coin::split(payment, listing.price_mist, ctx);
-        transfer::public_transfer(seller_payment, listing.seller);
+        transfer::public_transfer(seller_payment, listing.issuer);
 
         // Destructure listing, extract token, transfer to buyer
         let ServiceListing {
             id,
-            seller: _,
+            issuer: _,
             name: _,
             ip_address: _,
             price_mist: _,
             is_active: _,
+            min_bandwidth_bps: _,
+            min_duration_ms: _,
+            bw_granularity: _,
+            time_granularity: _,
             token,
         } = listing;
         object::delete(id);
@@ -290,7 +329,7 @@ module marketplace::marketplace;
     ) {
         event::emit(TokenRedeemed {
             token_id: object::id(&token),
-            listing_id: token.listing_id,
+            issuer: token.issuer,
             redeemed_by: ctx.sender(),
             ip_address: string::utf8(ip_address),
             valid_from_ms: token.valid_from_ms,
@@ -300,7 +339,7 @@ module marketplace::marketplace;
 
         let AccessToken {
             id, listing_id: _, service_name: _, ip_address: _,
-            valid_from_ms: _, expires_at_ms: _, bandwidth_bps: _, seller: _,
+            valid_from_ms: _, expires_at_ms: _, bandwidth_bps: _, issuer: _,
         } = token;
         object::delete(id);
     }
@@ -310,12 +349,16 @@ module marketplace::marketplace;
     // =========================================================
 
 
-    public fun listing_price(listing: &ServiceListing): u64     { listing.price_mist }
-    public fun listing_active(listing: &ServiceListing): bool    { listing.is_active }
-    public fun listing_seller(listing: &ServiceListing): address { listing.seller }
-    public fun listing_valid_from(listing: &ServiceListing): u64    { listing.token.valid_from_ms }
-    public fun listing_expires_at(listing: &ServiceListing): u64    { listing.token.expires_at_ms }
-    public fun listing_bandwidth_bps(listing: &ServiceListing): u64 { listing.token.bandwidth_bps }
+    public fun listing_price(listing: &ServiceListing): u64         { listing.price_mist }
+    public fun listing_active(listing: &ServiceListing): bool        { listing.is_active }
+    public fun listing_issuer(listing: &ServiceListing): address     { listing.issuer }
+    public fun listing_valid_from(listing: &ServiceListing): u64     { listing.token.valid_from_ms }
+    public fun listing_expires_at(listing: &ServiceListing): u64     { listing.token.expires_at_ms }
+    public fun listing_bandwidth_bps(listing: &ServiceListing): u64  { listing.token.bandwidth_bps }
+    public fun listing_min_bandwidth(listing: &ServiceListing): u64  { listing.min_bandwidth_bps }
+    public fun listing_min_duration(listing: &ServiceListing): u64   { listing.min_duration_ms }
+    public fun listing_bw_granularity(listing: &ServiceListing): u64 { listing.bw_granularity }
+    public fun listing_time_granularity(listing: &ServiceListing): u64 { listing.time_granularity }
     public fun token_listing_id(token: &AccessToken): ID            { token.listing_id }
     public fun token_expires_at(token: &AccessToken): u64           { token.expires_at_ms }
     public fun token_bandwidth_bps(token: &AccessToken): u64        { token.bandwidth_bps }

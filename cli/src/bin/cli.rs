@@ -31,17 +31,33 @@ enum Commands {
         #[arg(long)]
         price_sui: f64,
 
-        /// Earliest time buyers may set as their start, as Unix ms timestamp; 0 = no restriction
+        /// Earliest time buyers may set as their start, as Unix ms timestamp
         #[arg(long, default_value = "0")]
         valid_from_ms: u64,
 
-        /// Latest time buyers may set as their end, as Unix ms timestamp; 0 = no expiry
+        /// Latest time buyers may set as their end, as Unix ms timestamp
         #[arg(long, default_value = "0")]
         expires_at_ms: u64,
 
-        /// Maximum bandwidth in bytes per second buyers may request; 0 = unlimited
-        #[arg(long, default_value = "0")]
+        /// Maximum bandwidth in bytes per second buyers may request
+        #[arg(long, default_value = "1000000")]
         max_bandwidth_bps: u64,
+
+        /// Minimum bandwidth buyers must purchase in B/s
+        #[arg(long, default_value = "1000")]
+        min_bandwidth_bps: u64,
+
+        /// Minimum duration buyers must purchase in ms
+        #[arg(long, default_value = "1000")]
+        min_duration_ms: u64,
+
+        /// Bandwidth granularity — purchased bandwidth must be a multiple of this
+        #[arg(long, default_value = "1000")]
+        bw_granularity: u64,
+
+        /// Time granularity — purchased duration must be a multiple of this in ms
+        #[arg(long, default_value = "1000")]
+        time_granularity: u64,
     },
 
     /// Display existing service listings
@@ -49,6 +65,25 @@ enum Commands {
         /// Maximum number of listings to show
         #[arg(long, default_value = "20")]
         limit: u32,
+    },
+
+    /// Search listings by subnet, bandwidth, and time window (results sorted by price)
+    SearchListings {
+        /// Filter to listings whose IP is contained in this subnet (CIDR notation)
+        #[arg(long, default_value = "0.0.0.0/0")]
+        subnet: String,
+
+        /// Only show listings offering at least this bandwidth in B/s (0 = any)
+        #[arg(long, default_value = "0")]
+        bandwidth_bps: u64,
+
+        /// Only show listings available at or before this datetime, "YYYY-MM-DD HH:MM:SS" UTC
+        #[arg(long)]
+        start_date: Option<String>,
+
+        /// Only show listings valid at or after this datetime, "YYYY-MM-DD HH:MM:SS" UTC
+        #[arg(long)]
+        end_date: Option<String>,
     },
 
     /// Purchase a service listing
@@ -106,13 +141,19 @@ async fn main() -> Result<()> {
             marketplace::create_marketplace().await?;
         }
 
-        Commands::CreateListing { name, ip_address, price_sui, valid_from_ms, expires_at_ms, max_bandwidth_bps } => {
-            marketplace::create_listing(name, ip_address, price_sui, valid_from_ms, expires_at_ms, max_bandwidth_bps).await?;
+        Commands::CreateListing { name, ip_address, price_sui, valid_from_ms, expires_at_ms, max_bandwidth_bps, min_bandwidth_bps, min_duration_ms, bw_granularity, time_granularity } => {
+            marketplace::create_listing(name, ip_address, price_sui, valid_from_ms, expires_at_ms, max_bandwidth_bps, min_bandwidth_bps, min_duration_ms, bw_granularity, time_granularity).await?;
             // listing ID is printed inside create_listing
         }
 
         Commands::GetListings { limit } => {
             marketplace::get_listings(limit).await?;
+        }
+
+        Commands::SearchListings { subnet, bandwidth_bps, start_date, end_date } => {
+            let start_ms = start_date.as_deref().map(parse_date_ms).transpose()?.unwrap_or(0);
+            let end_ms   = end_date.as_deref().map(parse_date_ms).transpose()?.unwrap_or(0);
+            marketplace::search_listings(&subnet, bandwidth_bps, start_ms, end_ms).await?;
         }
 
         Commands::BuyListing { listing_id, start_date, end_date, bandwidth_bps } => {
