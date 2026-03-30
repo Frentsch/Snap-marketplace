@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::PathBuf;
+use sui_sdk_types::Address;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Config structs
@@ -12,15 +13,15 @@ pub struct SuiConfig {
     pub rpc_url:    String,
     pub gas_budget: u64,
     /// Path to the directory containing `sui.keystore` (e.g. `~/.sui/sui_config`).
-    pub keystore:   String,
-    /// Hex address of the signing account (e.g. `0xf714...`).
-    pub address:    String,
+    pub keystore:   PathBuf,
+    /// Signing account address.
+    pub address:    Address,
 }
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct MarketplaceConfig {
-    pub package_id:     String,
-    pub marketplace_id: String,
+    pub package_id:     Address,
+    pub marketplace_id: Address,
     pub coin_type:      String,
 }
 
@@ -30,12 +31,6 @@ pub struct MarketConfig {
     pub sui: SuiConfig,
     #[serde(rename = "Marketplace")]
     pub marketplace: MarketplaceConfig,
-}
-
-impl MarketConfig {
-    pub fn keystore_dir(&self) -> PathBuf {
-        PathBuf::from(&self.sui.keystore)
-    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

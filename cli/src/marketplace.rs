@@ -19,15 +19,9 @@ use crate::models::{AccessToken, MarketplaceObject, ServiceListing};
 use crate::utils::Wallet;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Parse helpers  (all derive values from the loaded config)
+// Config accessors
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn package_addr(cfg: &MarketConfig) -> Result<Address> {
-    cfg.marketplace.package_id.parse().context("Invalid package_id in config")
-}
-fn marketplace_addr(cfg: &MarketConfig) -> Result<Address> {
-    cfg.marketplace.marketplace_id.parse().context("Invalid marketplace_id in config")
-}
 fn coin_type_tag(cfg: &MarketConfig) -> Result<TypeTag> {
     cfg.marketplace.coin_type.parse().context("Invalid coin_type in config")
 }
@@ -78,7 +72,7 @@ async fn get_object_bcs<T: DeserializeOwned>(client: &mut Client, id: Address) -
 
 /// Return the ObjectBag ID that stores all listings.
 async fn get_bag_id(client: &mut Client, cfg: &MarketConfig) -> Result<Address> {
-    let mp: MarketplaceObject = get_object_bcs(client, marketplace_addr(cfg)?).await?;
+    let mp: MarketplaceObject = get_object_bcs(client, cfg.marketplace.marketplace_id).await?;
     Ok(Address::new(mp.listings.id))
 }
 
@@ -197,7 +191,7 @@ pub async fn create_marketplace() -> Result<Address> {
 
     builder.move_call(
         Function::new(
-            package_addr(&cfg)?,
+            cfg.marketplace.package_id,
             Identifier::new("marketplace").unwrap(),
             Identifier::new("create_marketplace").unwrap(),
         )
@@ -223,11 +217,11 @@ pub async fn create_listing(
     name: String,
     ip_address: String,
     price_sui: f64,
-    valid_from_ms: u64,
-    expires_at_ms: u64,
-    max_bandwidth_bps: u64,
-    min_bandwidth_bps: u64,
-    min_duration_ms: u64,
+    valid_from: u64,
+    expires_at: u64,
+    max_bandwidth: u64,
+    min_bandwidth: u64,
+    min_duration: u64,
     bw_granularity: u64,
     time_granularity: u64,
 ) -> Result<Address> {
@@ -239,21 +233,21 @@ pub async fn create_listing(
     builder.set_sender(wallet.address);
     builder.set_gas_budget(cfg.sui.gas_budget);
 
-    let mp  = builder.object(ObjectInput::new(marketplace_addr(&cfg)?));
+    let mp  = builder.object(ObjectInput::new(cfg.marketplace.marketplace_id));
     let a0  = builder.pure(&name.into_bytes());
     let a1  = builder.pure(&ip_address.into_bytes());
     let a2  = builder.pure(&price_mist);
-    let a3  = builder.pure(&valid_from_ms);
-    let a4  = builder.pure(&expires_at_ms);
-    let a5  = builder.pure(&max_bandwidth_bps);
-    let a6  = builder.pure(&min_bandwidth_bps);
-    let a7  = builder.pure(&min_duration_ms);
+    let a3  = builder.pure(&valid_from);
+    let a4  = builder.pure(&expires_at);
+    let a5  = builder.pure(&max_bandwidth);
+    let a6  = builder.pure(&min_bandwidth);
+    let a7  = builder.pure(&min_duration);
     let a8  = builder.pure(&bw_granularity);
     let a9  = builder.pure(&time_granularity);
 
     builder.move_call(
         Function::new(
-            package_addr(&cfg)?,
+            cfg.marketplace.package_id,
             Identifier::new("marketplace").unwrap(),
             Identifier::new("create_listing").unwrap(),
         )
@@ -267,13 +261,13 @@ pub async fn create_listing(
     println!("Listing created!");
     println!("  Listing:        {listing_id}");
     println!("  Price:          {price_sui} SUI");
-    println!("  Valid from:     {valid_from_ms} ms");
-    println!("  Expires at:     {expires_at_ms} ms");
-    println!("  Max BW:         {max_bandwidth_bps} B/s");
-    println!("  Min BW:         {min_bandwidth_bps} B/s");
-    println!("  Min duration:   {min_duration_ms} ms");
-    println!("  BW granularity: {bw_granularity} B/s");
-    println!("  Time gran.:     {time_granularity} ms");
+    println!("  Valid from:     {} s", valid_from);
+    println!("  Expires at:     {} s", expires_at);
+    println!("  Max BW:         {} kB/s", max_bandwidth);
+    println!("  Min BW:         {} kB/s", min_bandwidth);
+    println!("  Min duration:   {} s", min_duration);
+    println!("  BW granularity: {} kB/s", bw_granularity);
+    println!("  Time gran.:     {} s", time_granularity);
     Ok(listing_id)
 }
 
@@ -308,14 +302,14 @@ pub async fn get_listings(limit: u32) -> Result<()> {
     println!("{}", "─".repeat(100));
     for (id, l) in &listings {
         let price = l.price_mist as f64 / 1e9;
-        let bw = if l.token.bandwidth_bps == 0 {
+        let bw = if l.token.bandwidth == 0 {
             "unlimited".to_string()
         } else {
-            format!("{} B/s", l.token.bandwidth_bps)
+            format!("{} kB/s", l.token.bandwidth)
         };
         println!(
-            "{id:<68}  {price:>10.4}  {}  (expires: {}, bw: {bw})",
-            l.name, l.token.expires_at_ms
+            "{id:<68}  {price:>10.4}  {}  (expires: {} s, bw: {bw})",
+            l.name, l.token.expires_at
         );
     }
     println!("\n{} listing(s) shown.", listings.len());
@@ -328,9 +322,9 @@ pub async fn get_listings(limit: u32) -> Result<()> {
 
 pub async fn search_listings(
     subnet: &str,
-    min_bandwidth_bps: u64,
-    start_ms: u64,
-    end_ms: u64,
+    min_bandwidth: u64,
+    start: u64,
+    end: u64,
 ) -> Result<()> {
     use ipnet::IpNet;
     use std::net::IpAddr;
@@ -356,9 +350,9 @@ pub async fn search_listings(
         name:          String,
         price_mist:    u64,
         ip_address:    String,
-        valid_from_ms: u64,
-        expires_at_ms: u64,
-        bandwidth_bps: u64,
+        valid_from: u64,
+        expires_at: u64,
+        bandwidth: u64,
     }
 
     let mut rows: Vec<Row> = Vec::new();
@@ -374,18 +368,18 @@ pub async fn search_listings(
         if let Ok(ip) = IpAddr::from_str(host) {
             if !filter_net.contains(&ip) { continue; }
         }
-        if min_bandwidth_bps > 0 && l.token.bandwidth_bps < min_bandwidth_bps { continue; }
-        if start_ms > 0 && l.token.valid_from_ms > start_ms { continue; }
-        if end_ms   > 0 && l.token.expires_at_ms < end_ms   { continue; }
+        if min_bandwidth > 0 && l.token.bandwidth < min_bandwidth { continue; }
+        if start > 0 && l.token.valid_from > start { continue; }
+        if end   > 0 && l.token.expires_at < end   { continue; }
 
         rows.push(Row {
             id,
             name:          l.name.clone(),
             price_mist:    l.price_mist,
             ip_address:    l.ip_address.clone(),
-            valid_from_ms: l.token.valid_from_ms,
-            expires_at_ms: l.token.expires_at_ms,
-            bandwidth_bps: l.token.bandwidth_bps,
+            valid_from: l.token.valid_from,
+            expires_at: l.token.expires_at,
+            bandwidth: l.token.bandwidth,
         });
     }
 
@@ -399,10 +393,10 @@ pub async fn search_listings(
     println!("{:<68}  {:>10}  {:<22}  {}", "Listing ID", "Price SUI", "IP", "Name");
     println!("{}", "─".repeat(120));
     for r in &rows {
-        let bw = if r.bandwidth_bps == 0 { "unlimited".into() } else { format!("{} B/s", r.bandwidth_bps) };
+        let bw = if r.bandwidth == 0 { "unlimited".into() } else { format!("{} kB/s", r.bandwidth) };
         println!(
-            "{:<68}  {:>10.4}  {:<22}  {}  (from: {}, until: {}, bw: {bw})",
-            r.id, r.price_mist as f64 / 1e9, r.ip_address, r.name, r.valid_from_ms, r.expires_at_ms,
+            "{:<68}  {:>10.4}  {:<22}  {}  (from: {} s, until: {} s, bw: {bw})",
+            r.id, r.price_mist as f64 / 1e9, r.ip_address, r.name, r.valid_from, r.expires_at,
         );
     }
     println!("\n{} listing(s) found.", rows.len());
@@ -432,35 +426,35 @@ pub async fn get_ip_address(listing_id: &str) -> Result<String> {
 
 pub async fn buy_listing(
     listing_id: String,
-    start_ms: u64,
-    end_ms: u64,
-    bandwidth_bps: u64,
+    start: u64,
+    end: u64,
+    bandwidth: u64,
 ) -> Result<Address> {
     let (cfg, wallet) = load_ctx()?;
     let mut client = build_client(&cfg)?;
     let listing_obj_id: Address = listing_id.parse().context("Invalid listing ID")?;
 
     // Callers must resolve defaults before calling; zeros are rejected by the contract.
-    anyhow::ensure!(start_ms > 0,        "start_ms must be non-zero; resolve to current time before calling buy_listing");
-    anyhow::ensure!(end_ms > start_ms,   "end_ms must be greater than start_ms");
-    anyhow::ensure!(bandwidth_bps > 0,   "bandwidth_bps must be non-zero; resolve to seller's bound before calling buy_listing");
+    anyhow::ensure!(start > 0,        "start must be non-zero; resolve to current time before calling buy_listing");
+    anyhow::ensure!(end > start,   "end must be greater than start");
+    anyhow::ensure!(bandwidth > 0,   "bandwidth must be non-zero; resolve to seller's bound before calling buy_listing");
 
     // Fetch listing to validate granularity alignment before submitting the transaction.
     let listing: ServiceListing = get_object_bcs(&mut client, listing_obj_id).await?;
-    let duration_ms = end_ms - start_ms;
+    let duration = end - start;
     let tg = listing.time_granularity;
     let bg = listing.bw_granularity;
     anyhow::ensure!(
-        tg == 0 || duration_ms % tg == 0,
-        "duration {duration_ms} ms is not aligned to listing time_granularity {tg} ms \
-         (nearest lower end_ms: {})",
-        start_ms + (duration_ms / tg) * tg
+        tg == 0 || duration % tg == 0,
+        "duration {duration} s is not aligned to listing time_granularity {tg} s \
+         (nearest lower end: {})",
+        start + (duration / tg) * tg
     );
     anyhow::ensure!(
-        bg == 0 || bandwidth_bps % bg == 0,
-        "bandwidth {bandwidth_bps} B/s is not aligned to listing bw_granularity {bg} B/s \
+        bg == 0 || bandwidth % bg == 0,
+        "bandwidth {bandwidth} kB/s is not aligned to listing bw_granularity {bg} kB/s \
          (nearest lower value: {})",
-        (bandwidth_bps / bg) * bg
+        (bandwidth / bg) * bg
     );
 
     // Pass gas coin as payment — move_call will split price_mist from it.
@@ -469,15 +463,15 @@ pub async fn buy_listing(
     builder.set_gas_budget(cfg.sui.gas_budget);
 
     let gas_coin  = builder.gas();
-    let mp        = builder.object(ObjectInput::new(marketplace_addr(&cfg)?));
+    let mp        = builder.object(ObjectInput::new(cfg.marketplace.marketplace_id));
     let id_arg    = builder.pure(&listing_obj_id.into_inner()); // ID = [u8;32]
-    let start_arg = builder.pure(&start_ms);
-    let end_arg   = builder.pure(&end_ms);
-    let bw_arg    = builder.pure(&bandwidth_bps);
+    let start_arg = builder.pure(&start);
+    let end_arg   = builder.pure(&end);
+    let bw_arg    = builder.pure(&bandwidth);
 
     builder.move_call(
         Function::new(
-            package_addr(&cfg)?,
+            cfg.marketplace.package_id,
             Identifier::new("marketplace").unwrap(),
             Identifier::new("purchase").unwrap(),
         )
@@ -517,7 +511,7 @@ pub async fn redeem(token_id: String, ip_address: String) -> Result<()> {
 
     builder.move_call(
         Function::new(
-            package_addr(&cfg)?,
+            cfg.marketplace.package_id,
             Identifier::new("marketplace").unwrap(),
             Identifier::new("redeem").unwrap(),
         )

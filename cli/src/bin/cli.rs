@@ -32,32 +32,32 @@ enum Commands {
         #[arg(long)]
         price_sui: f64,
 
-        /// Earliest time buyers may set as their start, as Unix ms timestamp
+        /// Earliest time buyers may set as their start, as Unix seconds timestamp; 0 = now
         #[arg(long, default_value = "0")]
-        valid_from_ms: u64,
+        valid_from: u64,
 
-        /// Latest time buyers may set as their end, as Unix ms timestamp
+        /// Latest time buyers may set as their end, as Unix seconds timestamp; 0 = now+1h
         #[arg(long, default_value = "0")]
-        expires_at_ms: u64,
+        expires_at: u64,
 
-        /// Maximum bandwidth in bytes per second buyers may request
-        #[arg(long, default_value = "1000000")]
-        max_bandwidth_bps: u64,
-
-        /// Minimum bandwidth buyers must purchase in B/s
+        /// Maximum bandwidth buyers may request in kB/s
         #[arg(long, default_value = "1000")]
-        min_bandwidth_bps: u64,
+        max_bandwidth: u64,
 
-        /// Minimum duration buyers must purchase in ms
-        #[arg(long, default_value = "1000")]
-        min_duration_ms: u64,
+        /// Minimum bandwidth buyers must purchase in kB/s
+        #[arg(long, default_value = "1")]
+        min_bandwidth: u64,
 
-        /// Bandwidth granularity — purchased bandwidth must be a multiple of this
-        #[arg(long, default_value = "1000")]
+        /// Minimum duration buyers must purchase in seconds
+        #[arg(long, default_value = "1")]
+        min_duration: u64,
+
+        /// Bandwidth granularity — purchased bandwidth must be a multiple of this (kB/s)
+        #[arg(long, default_value = "1")]
         bw_granularity: u64,
 
-        /// Time granularity — purchased duration must be a multiple of this in ms
-        #[arg(long, default_value = "1000")]
+        /// Time granularity — purchased duration must be a multiple of this (seconds)
+        #[arg(long, default_value = "1")]
         time_granularity: u64,
     },
 
@@ -74,9 +74,9 @@ enum Commands {
         #[arg(long, default_value = "0.0.0.0/0")]
         subnet: String,
 
-        /// Only show listings offering at least this bandwidth in B/s (0 = any)
+        /// Only show listings offering at least this bandwidth in kB/s (0 = any)
         #[arg(long, default_value = "0")]
-        bandwidth_bps: u64,
+        bandwidth: u64,
 
         /// Only show listings available at or before this datetime, "YYYY-MM-DD HH:MM:SS" UTC
         #[arg(long)]
@@ -100,9 +100,9 @@ enum Commands {
         #[arg(long)]
         end_date: Option<String>,
 
-        /// Desired bandwidth in bytes per second; 0 = keep seller's max (default: 0)
+        /// Desired bandwidth in kB/s; 0 = seller's max (default: 0)
         #[arg(long, default_value = "0")]
-        bandwidth_bps: u64,
+        bandwidth: u64,
     },
 
     /// Redeem an access token
@@ -119,9 +119,9 @@ enum Commands {
     GetWallet {},
 }
 
-/// Parse "YYYY-MM-DD HH:MM:SS" (UTC) into a Unix timestamp in milliseconds.
+/// Parse "YYYY-MM-DD HH:MM:SS" (UTC) into a Unix timestamp in seconds.
 /// Also accepts the date-only form "YYYY-MM-DD", treating it as 00:00:00 UTC.
-fn parse_date_ms(s: &str) -> Result<u64> {
+fn parse_date(s: &str) -> Result<u64> {
     let dt = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
         .or_else(|_| {
             chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
@@ -130,7 +130,7 @@ fn parse_date_ms(s: &str) -> Result<u64> {
         .with_context(|| {
             format!("invalid datetime '{s}' — expected \"YYYY-MM-DD HH:MM:SS\" or \"YYYY-MM-DD\"")
         })?;
-    Ok(dt.and_utc().timestamp_millis() as u64)
+    Ok(dt.and_utc().timestamp() as u64)
 }
 
 #[tokio::main]
@@ -142,52 +142,66 @@ async fn main() -> Result<()> {
             marketplace::create_marketplace().await?;
         }
 
-        Commands::CreateListing { name, ip_address, price_sui, valid_from_ms, expires_at_ms, max_bandwidth_bps, min_bandwidth_bps, min_duration_ms, bw_granularity, time_granularity } => {
-            marketplace::create_listing(name, ip_address, price_sui, valid_from_ms, expires_at_ms, max_bandwidth_bps, min_bandwidth_bps, min_duration_ms, bw_granularity, time_granularity).await?;
-            // listing ID is printed inside create_listing
+        Commands::CreateListing { name, ip_address, price_sui, valid_from, expires_at, max_bandwidth, min_bandwidth, min_duration, bw_granularity, time_granularity } => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .context("System clock before UNIX epoch")?
+                .as_secs();
+            marketplace::create_listing(
+                name,
+                ip_address,
+                price_sui,
+                if valid_from == 0 { now }         else { valid_from },
+                if expires_at == 0 { now + 3_600 } else { expires_at },
+                max_bandwidth,
+                min_bandwidth,
+                min_duration,
+                bw_granularity,
+                time_granularity,
+            ).await?;
         }
 
         Commands::GetListings { limit } => {
             marketplace::get_listings(limit).await?;
         }
 
-        Commands::SearchListings { subnet, bandwidth_bps, start_date, end_date } => {
-            let start_ms = start_date.as_deref().map(parse_date_ms).transpose()?.unwrap_or(0);
-            let end_ms   = end_date.as_deref().map(parse_date_ms).transpose()?.unwrap_or(0);
-            marketplace::search_listings(&subnet, bandwidth_bps, start_ms, end_ms).await?;
+        Commands::SearchListings { subnet, bandwidth, start_date, end_date } => {
+            let start = start_date.as_deref().map(parse_date).transpose()?.unwrap_or(0);
+            let end   = end_date.as_deref().map(parse_date).transpose()?.unwrap_or(0);
+            marketplace::search_listings(&subnet, bandwidth, start, end).await?;
         }
 
-        Commands::BuyListing { listing_id, start_date, end_date, bandwidth_bps } => {
-            let start_ms_given = start_date.as_deref().map(parse_date_ms).transpose()?;
-            let end_ms_given   = end_date.as_deref().map(parse_date_ms).transpose()?;
+        Commands::BuyListing { listing_id, start_date, end_date, bandwidth } => {
+            let start_given = start_date.as_deref().map(parse_date).transpose()?;
+            let end_given   = end_date.as_deref().map(parse_date).transpose()?;
 
             // Always fetch the listing — needed for defaults and granularity alignment.
             let listing = marketplace::get_listing(&listing_id).await?;
-            let now_ms  = std::time::SystemTime::now()
+            let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .context("System clock before UNIX epoch")?
-                .as_millis() as u64;
+                .as_secs();
 
-            let start_ms  = start_ms_given.unwrap_or(now_ms);
-            let end_ms_raw = end_ms_given.unwrap_or(listing.token.expires_at_ms);
-            let bw_raw    = if bandwidth_bps == 0 { listing.token.bandwidth_bps } else { bandwidth_bps };
+            let start   = start_given.unwrap_or(now);
+            let end_raw = end_given.unwrap_or(listing.token.expires_at);
+            let bw_raw  = if bandwidth == 0 { listing.token.bandwidth } else { bandwidth };
 
             // Align duration down to the nearest multiple of time_granularity.
-            let duration_ms = end_ms_raw.saturating_sub(start_ms);
-            let end_ms = if listing.time_granularity > 0 {
-                start_ms + (duration_ms / listing.time_granularity) * listing.time_granularity
+            let duration = end_raw.saturating_sub(start);
+            let end = if listing.time_granularity > 0 {
+                start + (duration / listing.time_granularity) * listing.time_granularity
             } else {
-                end_ms_raw
+                end_raw
             };
 
             // Align bandwidth down to the nearest multiple of bw_granularity.
-            let bandwidth_bps = if listing.bw_granularity > 0 {
+            let bw = if listing.bw_granularity > 0 {
                 (bw_raw / listing.bw_granularity) * listing.bw_granularity
             } else {
                 bw_raw
             };
 
-            marketplace::buy_listing(listing_id, start_ms, end_ms, bandwidth_bps).await?;
+            marketplace::buy_listing(listing_id, start, end, bw).await?;
         }
 
         Commands::Redeem { token_id, ip_address } => {

@@ -74,11 +74,9 @@ fn keypair_from_entry(entry: &str) -> Result<(SimpleKeypair, Address)> {
 /// Load the wallet for the address specified in `market-config.toml`.
 /// The keystore file is read from `[Sui] keystore`.
 pub fn load_wallet(cfg: &MarketConfig) -> Result<Wallet> {
-    let address: Address = cfg.sui.address
-        .parse()
-        .context("Invalid address in [Sui] address")?;
+    let address = cfg.sui.address;
 
-    let ks_path = cfg.keystore_dir().join("sui.keystore");
+    let ks_path = cfg.sui.keystore.join("sui.keystore");
     let ks_bytes = std::fs::read(&ks_path)
         .with_context(|| format!("Cannot read {}", ks_path.display()))?;
     let entries: Vec<String> =

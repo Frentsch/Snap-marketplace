@@ -14,17 +14,17 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1")]
     ip: String,
 
-    /// Desired access start time as Unix ms timestamp; 0 = use seller's bound (default)
+    /// Desired access start time as Unix seconds timestamp; 0 = now (default)
     #[arg(long, default_value = "0")]
-    start_ms: u64,
+    start: u64,
 
-    /// Desired access end time as Unix ms timestamp; 0 = use seller's bound (default)
+    /// Desired access end time as Unix seconds timestamp; 0 = seller's bound (default)
     #[arg(long, default_value = "0")]
-    end_ms: u64,
+    end: u64,
 
-    /// Desired bandwidth in bytes per second; 0 = use seller's bound (default)
+    /// Desired bandwidth in kB/s; 0 = seller's bound (default)
     #[arg(long, default_value = "0")]
-    bandwidth_bps: u64,
+    bandwidth: u64,
 }
 
 async fn try_connect(addr: &str) -> Result<String> {
@@ -46,32 +46,32 @@ async fn main() -> Result<()> {
     let server_addr = listing.ip_address.clone();
     println!("Service address: {server_addr}");
 
-    let now_ms = std::time::SystemTime::now()
+    let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .context("System clock before UNIX epoch")?
-        .as_millis() as u64;
+        .as_secs();
 
-    let start_ms  = if args.start_ms     == 0 { now_ms }                        else { args.start_ms };
-    let end_ms_raw = if args.end_ms      == 0 { listing.token.expires_at_ms }   else { args.end_ms };
-    let bw_raw    = if args.bandwidth_bps == 0 { listing.token.bandwidth_bps }  else { args.bandwidth_bps };
+    let start   = if args.start     == 0 { now }                        else { args.start };
+    let end_raw = if args.end       == 0 { listing.token.expires_at }   else { args.end };
+    let bw_raw  = if args.bandwidth == 0 { listing.token.bandwidth }    else { args.bandwidth };
 
     // Align duration down to the nearest multiple of time_granularity.
-    let duration_ms = end_ms_raw.saturating_sub(start_ms);
-    let end_ms = if listing.time_granularity > 0 {
-        start_ms + (duration_ms / listing.time_granularity) * listing.time_granularity
+    let duration = end_raw.saturating_sub(start);
+    let end = if listing.time_granularity > 0 {
+        start + (duration / listing.time_granularity) * listing.time_granularity
     } else {
-        end_ms_raw
+        end_raw
     };
 
     // Align bandwidth down to the nearest multiple of bw_granularity.
-    let bandwidth_bps = if listing.bw_granularity > 0 {
+    let bw = if listing.bw_granularity > 0 {
         (bw_raw / listing.bw_granularity) * listing.bw_granularity
     } else {
         bw_raw
     };
     // 2. Buy the listing → receive an AccessToken.
     println!("Buying listing {}…", args.listing_id);
-    let token_id = cli::marketplace::buy_listing(args.listing_id.clone(), start_ms, end_ms, bandwidth_bps).await?;
+    let token_id = cli::marketplace::buy_listing(args.listing_id.clone(), start, end, bw).await?;
 
     // 3. Redeem the token, recording our IP so the server will authorize us.
     println!("Redeeming token {token_id} with IP {}…", args.ip);

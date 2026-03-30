@@ -30,32 +30,32 @@ struct Args {
     #[arg(long, default_value = "0.01")]
     price_sui: f64,
 
-    /// Earliest time buyers may set as their start, as Unix ms timestamp; 0 = now (default)
+    /// Earliest time buyers may set as their start, as Unix seconds timestamp; 0 = now (default)
     #[arg(long, default_value = "0")]
-    valid_from_ms: u64,
+    valid_from: u64,
 
-    /// Latest time buyers may set as their end, as Unix ms timestamp; 0 = now+1h (default)
+    /// Latest time buyers may set as their end, as Unix seconds timestamp; 0 = now+1h (default)
     #[arg(long, default_value = "0")]
-    expires_at_ms: u64,
+    expires_at: u64,
 
-    /// Maximum bandwidth in bytes per second buyers may request
-    #[arg(long, default_value = "10000")]
-    max_bandwidth_bps: u64,
+    /// Maximum bandwidth buyers may request in kB/s
+    #[arg(long, default_value = "10")]
+    max_bandwidth: u64,
 
-    /// Minimum bandwidth buyers must purchase in B/s
-    #[arg(long, default_value = "1000")]
-    min_bandwidth_bps: u64,
+    /// Minimum bandwidth buyers must purchase in kB/s
+    #[arg(long, default_value = "1")]
+    min_bandwidth: u64,
 
-    /// Minimum duration buyers must purchase in ms
-    #[arg(long, default_value = "1000")]
-    min_duration_ms: u64,
+    /// Minimum duration buyers must purchase in seconds
+    #[arg(long, default_value = "1")]
+    min_duration: u64,
 
-    /// Bandwidth granularity in B/s
-    #[arg(long, default_value = "1000")]
+    /// Bandwidth granularity in kB/s
+    #[arg(long, default_value = "1")]
     bw_granularity: u64,
 
-    /// Time granularity in ms
-    #[arg(long, default_value = "10000")]
+    /// Time granularity in seconds
+    #[arg(long, default_value = "10")]
     time_granularity: u64,
 
     /// TCP address to listen on for authorization checks
@@ -120,11 +120,11 @@ async fn event_loop(
                 match bcs::from_bytes::<TokenRedeemed>(bcs_bytes.as_ref()) {
                     Ok(redeemed) if Address::new(redeemed.issuer) == issuer_address => {
                         println!(
-                            "Redemption received — authorizing IP: {}  ({} bps, {} → {})",
+                            "Redemption received — authorizing IP: {}  ({} kB/s, {} s → {} s)",
                             redeemed.ip_address,
-                            redeemed.bandwidth_bps,
-                            redeemed.valid_from_ms,
-                            redeemed.expires_at_ms,
+                            redeemed.bandwidth,
+                            redeemed.valid_from,
+                            redeemed.expires_at,
                         );
                         authorized.write().await.insert(redeemed.ip_address.clone());
                     }
@@ -182,20 +182,19 @@ async fn tcp_listener_loop(
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    // 1. Resolve 0 → now / now+1h for valid_from_ms / expires_at_ms.
-    let now_ms = std::time::SystemTime::now()
+    // 1. Resolve defaults.
+    let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .context("System clock before UNIX epoch")?
-        .as_millis() as u64;
-    let valid_from_ms = if args.valid_from_ms == 0 { now_ms } else { args.valid_from_ms };
-    let expires_at_ms = if args.expires_at_ms == 0 { now_ms + 3_600_000 } else { args.expires_at_ms };
-    let duration_ms   = expires_at_ms - valid_from_ms;
-
-    // Resolve 0 → tenth of max for constraint fields.
-    let min_bandwidth_bps = if args.min_bandwidth_bps == 0 { args.max_bandwidth_bps / 10 } else { args.min_bandwidth_bps };
-    let bw_granularity    = if args.bw_granularity    == 0 { args.max_bandwidth_bps / 10 } else { args.bw_granularity };
-    let min_duration_ms   = if args.min_duration_ms   == 0 { duration_ms / 10 }            else { args.min_duration_ms };
-    let time_granularity  = if args.time_granularity  == 0 { duration_ms / 10 }            else { args.time_granularity };
+        .as_secs();
+    let valid_from   = if args.valid_from == 0 { now }         else { args.valid_from };
+    let expires_at   = if args.expires_at == 0 { now + 3_600 } else { args.expires_at };
+    let duration     = expires_at - valid_from;
+    let max_bandwidth = args.max_bandwidth;
+    let min_bandwidth = if args.min_bandwidth  == 0 { max_bandwidth / 10 } else { args.min_bandwidth };
+    let bw_granularity   = if args.bw_granularity   == 0 { max_bandwidth / 10 } else { args.bw_granularity };
+    let min_duration     = if args.min_duration      == 0 { duration / 10 }     else { args.min_duration };
+    let time_granularity = if args.time_granularity  == 0 { duration / 10 }     else { args.time_granularity };
 
     // 2. Load wallet — we need the address and RPC URL.
     let cfg = cli::config::load_config()?;
@@ -205,18 +204,18 @@ async fn main() -> Result<()> {
 
     // 3. Create the marketplace listing with ip_address = listen address.
     println!(
-        "Creating listing '{}' at {} ({} bps, {} → {})",
-        args.name, args.listen, args.max_bandwidth_bps, valid_from_ms, expires_at_ms
+        "Creating listing '{}' at {} ({} kB/s, {} s → {} s)",
+        args.name, args.listen, max_bandwidth, valid_from, expires_at
     );
     let listing_id = cli::marketplace::create_listing(
         args.name.clone(),
         args.listen.clone(),
         args.price_sui,
-        valid_from_ms,
-        expires_at_ms,
-        args.max_bandwidth_bps,
-        min_bandwidth_bps,
-        min_duration_ms,
+        valid_from,
+        expires_at,
+        max_bandwidth,
+        min_bandwidth,
+        min_duration,
         bw_granularity,
         time_granularity,
     )

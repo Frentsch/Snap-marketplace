@@ -19,7 +19,7 @@ dirs       = "5"
 toml       = "0.8"
 
 # sui-rust-sdk — new modular SDK
-sui-sdk-types           = { git = "https://github.com/mystenlabs/sui-rust-sdk", package = "sui-sdk-types",           features = ["hash"] }
+sui-sdk-types           = { git = "https://github.com/mystenlabs/sui-rust-sdk", package = "sui-sdk-types",           features = ["hash", "serde"] }
 sui-crypto              = { git = "https://github.com/mystenlabs/sui-rust-sdk", package = "sui-crypto",              features = ["ed25519", "secp256k1", "secp256r1"] }
 sui-rpc                 = { git = "https://github.com/mystenlabs/sui-rust-sdk", package = "sui-rpc" }
 sui-transaction-builder = { git = "https://github.com/mystenlabs/sui-rust-sdk", package = "sui-transaction-builder", features = ["intents"] }
