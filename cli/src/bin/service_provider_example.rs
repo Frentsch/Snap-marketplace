@@ -1,14 +1,15 @@
-/// service_provider — registers a listing on the marketplace, polls for
-/// TokenRedeemed events, and gates TCP connections by the redeemer's IP.
+/// service_provider — registers a listing on the marketplace, subscribes to
+/// on-chain checkpoints for TokenRedeemed events, and gates TCP connections
+/// by the redeemer's IP.
 use anyhow::{Context, Result};
 use clap::Parser;
-use move_core_types::identifier::Identifier;
-use std::{collections::HashSet, str::FromStr, sync::Arc};
-use sui_sdk::{rpc_types::EventFilter, SuiClient, SuiClientBuilder};
-use sui_types::base_types::ObjectID;
-use tokio::{io::AsyncWriteExt, net::TcpListener, sync::RwLock, time::{sleep, Duration}};
+use futures::StreamExt;
+use std::{collections::HashSet, sync::Arc};
+use sui_rpc::{Client, proto::sui::rpc::v2::SubscribeCheckpointsRequest};
+use sui_sdk_types::Address;
+use tokio::{io::AsyncWriteExt, net::TcpListener, sync::RwLock};
 
-use cli::marketplace::PACKAGE_ID;
+use cli::models::TokenRedeemed;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CLI args
@@ -17,10 +18,6 @@ use cli::marketplace::PACKAGE_ID;
 #[derive(Parser)]
 #[command(name = "service-provider", about = "Marketplace service provider server")]
 struct Args {
-    /// Use secondary (not active) address for local testing
-    #[arg(short = 's', long )]
-    secondary: bool,
-
     /// Human-readable service name shown in the marketplace listing
     #[arg(long, default_value = "Test Server")]
     name: String,
@@ -63,65 +60,75 @@ struct Args {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Event polling loop
+// Checkpoint subscription event loop
 // ─────────────────────────────────────────────────────────────────────────────
 
 async fn event_loop(
-    client: SuiClient,
-    issuer: String,
+    rpc_url: String,
+    issuer_address: Address,
     authorized: Arc<RwLock<HashSet<String>>>,
-) -> Result<()>{
-    let filter = match (|| -> Result<EventFilter> {
-        Ok(EventFilter::MoveEventModule {
-            package: ObjectID::from_str(PACKAGE_ID)?,
-            module: Identifier::new("marketplace")?,
-        })
-    })() {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("Failed to build event filter: {e}");
-            return Ok(());
-        }
-    };
+) -> Result<()> {
+    let mut client = Client::new(rpc_url.as_str())
+        .map_err(|e| anyhow::anyhow!("Cannot connect to {rpc_url}: {e}"))?;
 
-    println!("Polling marketplace events every 3s, watching redemptions for issuer {issuer}");
+    let mut stream = client
+        .subscription_client()
+        .subscribe_checkpoints(SubscribeCheckpointsRequest::default())
+        .await
+        .context("subscribe_checkpoints failed")?
+        .into_inner();
 
-    // Manually poll query_events with a moving cursor so we catch events
-    // emitted after startup. get_events_stream only drains existing events
-    // and terminates — it does not wait for future ones.
-    let mut cursor = None;
-    loop {
-        match client.event_api().query_events(filter.clone(), cursor, Some(100), false).await {
-            Ok(page) => {
-                for event in &page.data {
-                    if event.type_.name.as_str() != "TokenRedeemed" {
+    println!("Subscribed to checkpoints — watching for redemptions issued by {issuer_address}");
+
+    while let Some(item) = stream.next().await {
+        let response = item.context("Checkpoint stream error")?;
+        let checkpoint = match response.checkpoint {
+            Some(c) => c,
+            None => continue,
+        };
+
+        for tx in &checkpoint.transactions {
+            let tx_events = match tx.events.as_ref() {
+                Some(e) => e,
+                None => continue,
+            };
+
+            for event in &tx_events.events {
+                let event_type = match event.event_type.as_deref() {
+                    Some(t) => t,
+                    None => continue,
+                };
+                if !event_type.contains("::marketplace::TokenRedeemed") {
+                    continue;
+                }
+
+                let bcs_bytes = match event.contents.as_ref().and_then(|b| b.value.as_ref()) {
+                    Some(b) => b,
+                    None => {
+                        eprintln!("Warning: TokenRedeemed event has no BCS contents");
                         continue;
                     }
-                    let j = &event.parsed_json;
-                    if j["issuer"].as_str().unwrap_or("") != issuer {
-                        continue;
+                };
+
+                match bcs::from_bytes::<TokenRedeemed>(bcs_bytes.as_ref()) {
+                    Ok(redeemed) if Address::new(redeemed.issuer) == issuer_address => {
+                        println!(
+                            "Redemption received — authorizing IP: {}  ({} bps, {} → {})",
+                            redeemed.ip_address,
+                            redeemed.bandwidth_bps,
+                            redeemed.valid_from_ms,
+                            redeemed.expires_at_ms,
+                        );
+                        authorized.write().await.insert(redeemed.ip_address.clone());
                     }
-                    if let Some(ip) = j["ip_address"].as_str() {
-                        println!("Redemption received — authorizing IP: {ip}");
-                        authorized.write().await.insert(ip.to_string());
-                    }
-                    println!("reserved {} bps from {} to {}", j["bandwidth_bps"],j["valid_from_ms"], j["expires_at_ms"]);
+                    Ok(_) => {} // different issuer — not our token
+                    Err(e) => eprintln!("Warning: failed to deserialize TokenRedeemed: {e}"),
                 }
-                // Advance cursor if the node returned one
-                if page.next_cursor.is_some() {
-                    cursor = page.next_cursor;
-                }
-                // If we exhausted all pages, wait before polling again
-                if !page.has_next_page {
-                    sleep(Duration::from_secs(3)).await;
-                }
-            }
-            Err(e) => {
-                eprintln!("Event query error: {e}");
-                sleep(Duration::from_secs(5)).await;
             }
         }
     }
+
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -144,7 +151,7 @@ async fn tcp_listener_loop(
         };
         let ip = peer.ip().to_string();
         let auth = authorized.clone();
-        println!("received connection from {ip}");
+        println!("Connection from {ip}");
         tokio::spawn(async move {
             let reply = if auth.read().await.contains(&ip) {
                 "authorized\n"
@@ -155,7 +162,6 @@ async fn tcp_listener_loop(
                 eprintln!("Write error for {ip}: {e}");
                 return;
             }
-            // Explicitly shut down the write half so clients (nc, curl) see EOF.
             let _ = stream.shutdown().await;
         });
     }
@@ -174,18 +180,26 @@ async fn main() -> Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .context("System clock before UNIX epoch")?
         .as_millis() as u64;
-    let valid_from_ms  = if args.valid_from_ms  == 0 { now_ms } else { args.valid_from_ms };
-    let expires_at_ms  = if args.expires_at_ms  == 0 { now_ms + 3_600_000 } else { args.expires_at_ms };
-    let duration_ms    = expires_at_ms - valid_from_ms;
+    let valid_from_ms = if args.valid_from_ms == 0 { now_ms } else { args.valid_from_ms };
+    let expires_at_ms = if args.expires_at_ms == 0 { now_ms + 3_600_000 } else { args.expires_at_ms };
+    let duration_ms   = expires_at_ms - valid_from_ms;
 
-    // Resolve 0 → tenth of max for the constraint fields.
+    // Resolve 0 → tenth of max for constraint fields.
     let min_bandwidth_bps = if args.min_bandwidth_bps == 0 { args.max_bandwidth_bps / 10 } else { args.min_bandwidth_bps };
     let bw_granularity    = if args.bw_granularity    == 0 { args.max_bandwidth_bps / 10 } else { args.bw_granularity };
     let min_duration_ms   = if args.min_duration_ms   == 0 { duration_ms / 10 }            else { args.min_duration_ms };
     let time_granularity  = if args.time_granularity  == 0 { duration_ms / 10 }            else { args.time_granularity };
 
-    // 2. Create the marketplace listing with ip_address = listen address.
-    println!("Creating marketplace listing '{}' advertising {} bps from {} to {}", args.name, args.max_bandwidth_bps, valid_from_ms, expires_at_ms);
+    // 2. Load wallet — we need the address and RPC URL.
+    let mut wallet = cli::utils::get_wallet().await?;
+    let issuer_address = wallet.active_address()?;
+    let rpc_url = wallet.rpc_url.clone();
+
+    // 3. Create the marketplace listing with ip_address = listen address.
+    println!(
+        "Creating listing '{}' at {} ({} bps, {} → {})",
+        args.name, args.listen, args.max_bandwidth_bps, valid_from_ms, expires_at_ms
+    );
     let listing_id = cli::marketplace::create_listing(
         args.name.clone(),
         args.listen.clone(),
@@ -201,20 +215,11 @@ async fn main() -> Result<()> {
     .await?;
     println!("Listing ID: {listing_id}");
 
-    // 3. Build an HTTP Sui client for event polling (no WebSocket needed).
-    let mut wallet = cli::utils::get_wallet().await?;
-    let issuer = wallet.active_address()?.to_string();
-    let env = wallet.get_active_env()?;
-    let client = SuiClientBuilder::default()
-        .build(&env.rpc)
-        .await
-        .context("Failed to build Sui client")?;
-
     // 4. Shared authorized-IP set.
     let authorized: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
 
-    // 5. Spawn event polling in the background.
-    tokio::spawn(event_loop(client, issuer, authorized.clone()));
+    // 5. Spawn checkpoint subscription in the background.
+    tokio::spawn(event_loop(rpc_url, issuer_address, authorized.clone()));
 
     // 6. Run TCP listener (blocks until error).
     tcp_listener_loop(&args.listen, authorized).await
