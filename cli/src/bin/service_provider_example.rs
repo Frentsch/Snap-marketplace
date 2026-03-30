@@ -5,7 +5,11 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use futures::StreamExt;
 use std::{collections::HashSet, sync::Arc};
-use sui_rpc::{Client, proto::sui::rpc::v2::SubscribeCheckpointsRequest};
+use sui_rpc::{
+    Client,
+    field::{FieldMask, FieldMaskUtil},
+    proto::sui::rpc::v2::SubscribeCheckpointsRequest,
+};
 use sui_sdk_types::Address;
 use tokio::{io::AsyncWriteExt, net::TcpListener, sync::RwLock};
 
@@ -73,7 +77,10 @@ async fn event_loop(
 
     let mut stream = client
         .subscription_client()
-        .subscribe_checkpoints(SubscribeCheckpointsRequest::default())
+        .subscribe_checkpoints(
+            SubscribeCheckpointsRequest::default()
+                .with_read_mask(FieldMask::from_str("transactions.events")),
+        )
         .await
         .context("subscribe_checkpoints failed")?
         .into_inner();
@@ -191,9 +198,10 @@ async fn main() -> Result<()> {
     let time_granularity  = if args.time_granularity  == 0 { duration_ms / 10 }            else { args.time_granularity };
 
     // 2. Load wallet — we need the address and RPC URL.
-    let mut wallet = cli::utils::get_wallet().await?;
-    let issuer_address = wallet.active_address()?;
-    let rpc_url = wallet.rpc_url.clone();
+    let cfg = cli::config::load_config()?;
+    let wallet = cli::utils::load_wallet(&cfg)?;
+    let issuer_address = wallet.active_address();
+    let rpc_url = cfg.sui.rpc_url.clone();
 
     // 3. Create the marketplace listing with ip_address = listen address.
     println!(

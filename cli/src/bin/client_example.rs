@@ -1,6 +1,6 @@
 /// client — buys a marketplace listing, redeems the access token, then
 /// connects to the service address in metadata_uri and prints the response.
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use tokio::{net::TcpStream, time::{sleep, Duration}};
 
@@ -39,14 +39,39 @@ async fn try_connect(addr: &str) -> Result<String> {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    // 1. Fetch server address BEFORE buying — purchase removes the listing.
+    // 1. Fetch listing BEFORE buying — purchase removes it from the marketplace.
+    //    Also resolve any 0-defaults using the seller's bounds.
     println!("Fetching listing metadata…");
-    let server_addr = cli::marketplace::get_ip_address(&args.listing_id).await?;
+    let listing = cli::marketplace::get_listing(&args.listing_id).await?;
+    let server_addr = listing.ip_address.clone();
     println!("Service address: {server_addr}");
 
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("System clock before UNIX epoch")?
+        .as_millis() as u64;
+
+    let start_ms  = if args.start_ms     == 0 { now_ms }                        else { args.start_ms };
+    let end_ms_raw = if args.end_ms      == 0 { listing.token.expires_at_ms }   else { args.end_ms };
+    let bw_raw    = if args.bandwidth_bps == 0 { listing.token.bandwidth_bps }  else { args.bandwidth_bps };
+
+    // Align duration down to the nearest multiple of time_granularity.
+    let duration_ms = end_ms_raw.saturating_sub(start_ms);
+    let end_ms = if listing.time_granularity > 0 {
+        start_ms + (duration_ms / listing.time_granularity) * listing.time_granularity
+    } else {
+        end_ms_raw
+    };
+
+    // Align bandwidth down to the nearest multiple of bw_granularity.
+    let bandwidth_bps = if listing.bw_granularity > 0 {
+        (bw_raw / listing.bw_granularity) * listing.bw_granularity
+    } else {
+        bw_raw
+    };
     // 2. Buy the listing → receive an AccessToken.
     println!("Buying listing {}…", args.listing_id);
-    let token_id = cli::marketplace::buy_listing(args.listing_id.clone(), args.start_ms, args.end_ms, args.bandwidth_bps).await?;
+    let token_id = cli::marketplace::buy_listing(args.listing_id.clone(), start_ms, end_ms, bandwidth_bps).await?;
 
     // 3. Redeem the token, recording our IP so the server will authorize us.
     println!("Redeeming token {token_id} with IP {}…", args.ip);

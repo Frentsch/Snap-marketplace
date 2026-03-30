@@ -14,41 +14,41 @@ use sui_rpc::{
 use sui_sdk_types::{Address, Identifier, TypeTag};
 use sui_transaction_builder::{Function, ObjectInput, TransactionBuilder};
 
+use crate::config::{load_config, MarketConfig};
 use crate::models::{AccessToken, MarketplaceObject, ServiceListing};
 use crate::utils::Wallet;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Constants — update after each `sui client publish`
+// Parse helpers  (all derive values from the loaded config)
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub const PACKAGE_ID: &str =
-    "0x16c820f39b159f91a10acb9dcf2e9b12b3d1ba855b7f49d9221574b44fa3cd91";
-const MARKETPLACE_ID: &str =
-    "0x6105d1937ce316c44aa02e2da7a4e6e621605e9b97e2280d0513998a6f540d99";
-const COIN_TYPE: &str  = "0x2::sui::SUI";
-const GAS_BUDGET: u64 = 50_000_000; // 0.05 SUI
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Parse helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
-fn package_addr() -> Result<Address> {
-    PACKAGE_ID.parse().context("Invalid PACKAGE_ID")
+fn package_addr(cfg: &MarketConfig) -> Result<Address> {
+    cfg.marketplace.package_id.parse().context("Invalid package_id in config")
 }
-fn marketplace_addr() -> Result<Address> {
-    MARKETPLACE_ID.parse().context("Invalid MARKETPLACE_ID")
+fn marketplace_addr(cfg: &MarketConfig) -> Result<Address> {
+    cfg.marketplace.marketplace_id.parse().context("Invalid marketplace_id in config")
 }
-fn coin_type_tag() -> Result<TypeTag> {
-    COIN_TYPE.parse().context("Invalid COIN_TYPE")
+fn coin_type_tag(cfg: &MarketConfig) -> Result<TypeTag> {
+    cfg.marketplace.coin_type.parse().context("Invalid coin_type in config")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Client construction
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn build_client(wallet: &Wallet) -> Result<Client> {
-    Client::new(wallet.rpc_url.as_str())
-        .map_err(|e| anyhow::anyhow!("Cannot connect to {}: {e}", wallet.rpc_url))
+fn build_client(cfg: &MarketConfig) -> Result<Client> {
+    let url = cfg.sui.rpc_url.as_str();
+    Client::new(url).map_err(|e| anyhow::anyhow!("Cannot connect to {url}: {e}"))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Load both config and wallet in one call
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn load_ctx() -> Result<(MarketConfig, Wallet)> {
+    let cfg = load_config()?;
+    let wallet = crate::utils::load_wallet(&cfg)?;
+    Ok((cfg, wallet))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -77,8 +77,8 @@ async fn get_object_bcs<T: DeserializeOwned>(client: &mut Client, id: Address) -
 }
 
 /// Return the ObjectBag ID that stores all listings.
-async fn get_bag_id(client: &mut Client) -> Result<Address> {
-    let mp: MarketplaceObject = get_object_bcs(client, marketplace_addr()?).await?;
+async fn get_bag_id(client: &mut Client, cfg: &MarketConfig) -> Result<Address> {
+    let mp: MarketplaceObject = get_object_bcs(client, marketplace_addr(cfg)?).await?;
     Ok(Address::new(mp.listings.id))
 }
 
@@ -188,20 +188,20 @@ fn find_access_token(effects: &TransactionEffects) -> Result<Address> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub async fn create_marketplace() -> Result<Address> {
-    let wallet = crate::utils::load_wallet()?;
-    let mut client = build_client(&wallet)?;
+    let (cfg, wallet) = load_ctx()?;
+    let mut client = build_client(&cfg)?;
 
     let mut builder = TransactionBuilder::new();
     builder.set_sender(wallet.address);
-    builder.set_gas_budget(GAS_BUDGET);
+    builder.set_gas_budget(cfg.sui.gas_budget);
 
     builder.move_call(
         Function::new(
-            package_addr()?,
+            package_addr(&cfg)?,
             Identifier::new("marketplace").unwrap(),
             Identifier::new("create_marketplace").unwrap(),
         )
-        .with_type_args(vec![coin_type_tag()?]),
+        .with_type_args(vec![coin_type_tag(&cfg)?]),
         vec![],
     );
 
@@ -209,9 +209,9 @@ pub async fn create_marketplace() -> Result<Address> {
     let mp_id = find_created(&effects, "::marketplace::Marketplace")?;
 
     println!("Marketplace created!");
-    println!("  Coin type:      {COIN_TYPE}");
+    println!("  Coin type:      {}", cfg.marketplace.coin_type);
     println!("  Marketplace ID: {mp_id}");
-    println!("  Update MARKETPLACE_ID in marketplace.rs to use it.");
+    println!("  Set marketplace_id = \"{mp_id}\" in market-config.toml");
     Ok(mp_id)
 }
 
@@ -231,15 +231,15 @@ pub async fn create_listing(
     bw_granularity: u64,
     time_granularity: u64,
 ) -> Result<Address> {
-    let wallet = crate::utils::load_wallet()?;
-    let mut client = build_client(&wallet)?;
+    let (cfg, wallet) = load_ctx()?;
+    let mut client = build_client(&cfg)?;
     let price_mist = (price_sui * 1_000_000_000.0) as u64;
 
     let mut builder = TransactionBuilder::new();
     builder.set_sender(wallet.address);
-    builder.set_gas_budget(GAS_BUDGET);
+    builder.set_gas_budget(cfg.sui.gas_budget);
 
-    let mp  = builder.object(ObjectInput::new(marketplace_addr()?));
+    let mp  = builder.object(ObjectInput::new(marketplace_addr(&cfg)?));
     let a0  = builder.pure(&name.into_bytes());
     let a1  = builder.pure(&ip_address.into_bytes());
     let a2  = builder.pure(&price_mist);
@@ -253,11 +253,11 @@ pub async fn create_listing(
 
     builder.move_call(
         Function::new(
-            package_addr()?,
+            package_addr(&cfg)?,
             Identifier::new("marketplace").unwrap(),
             Identifier::new("create_listing").unwrap(),
         )
-        .with_type_args(vec![coin_type_tag()?]),
+        .with_type_args(vec![coin_type_tag(&cfg)?]),
         vec![mp, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9],
     );
 
@@ -282,10 +282,10 @@ pub async fn create_listing(
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub async fn get_listings(limit: u32) -> Result<()> {
-    let wallet = crate::utils::load_wallet()?;
-    let mut client = build_client(&wallet)?;
+    let (cfg, _wallet) = load_ctx()?;
+    let mut client = build_client(&cfg)?;
 
-    let bag_id = get_bag_id(&mut client).await?;
+    let bag_id = get_bag_id(&mut client, &cfg).await?;
     let mut ids = list_listing_ids(&client, bag_id).await?;
     ids.truncate(limit as usize);
 
@@ -340,10 +340,10 @@ pub async fn search_listings(
         .parse()
         .with_context(|| format!("Invalid subnet '{subnet}'"))?;
 
-    let wallet = crate::utils::load_wallet()?;
-    let mut client = build_client(&wallet)?;
+    let (cfg, _wallet) = load_ctx()?;
+    let mut client = build_client(&cfg)?;
 
-    let bag_id = get_bag_id(&mut client).await?;
+    let bag_id = get_bag_id(&mut client, &cfg).await?;
     let ids = list_listing_ids(&client, bag_id).await?;
 
     if ids.is_empty() {
@@ -410,15 +410,20 @@ pub async fn search_listings(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// get_ip_address  (called by client_example before purchasing)
+// get_listing / get_ip_address
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub async fn get_ip_address(listing_id: &str) -> Result<String> {
-    let wallet = crate::utils::load_wallet()?;
-    let mut client = build_client(&wallet)?;
+/// Fetch and BCS-deserialise a single ServiceListing by its object ID.
+/// Callers use this to inspect seller bounds before calling `buy_listing`.
+pub async fn get_listing(listing_id: &str) -> Result<ServiceListing> {
+    let (cfg, _wallet) = load_ctx()?;
+    let mut client = build_client(&cfg)?;
     let id: Address = listing_id.parse().context("Invalid listing ID")?;
-    let l: ServiceListing = get_object_bcs(&mut client, id).await?;
-    Ok(l.ip_address)
+    get_object_bcs(&mut client, id).await
+}
+
+pub async fn get_ip_address(listing_id: &str) -> Result<String> {
+    Ok(get_listing(listing_id).await?.ip_address)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -431,17 +436,40 @@ pub async fn buy_listing(
     end_ms: u64,
     bandwidth_bps: u64,
 ) -> Result<Address> {
-    let wallet = crate::utils::load_wallet()?;
-    let mut client = build_client(&wallet)?;
+    let (cfg, wallet) = load_ctx()?;
+    let mut client = build_client(&cfg)?;
     let listing_obj_id: Address = listing_id.parse().context("Invalid listing ID")?;
+
+    // Callers must resolve defaults before calling; zeros are rejected by the contract.
+    anyhow::ensure!(start_ms > 0,        "start_ms must be non-zero; resolve to current time before calling buy_listing");
+    anyhow::ensure!(end_ms > start_ms,   "end_ms must be greater than start_ms");
+    anyhow::ensure!(bandwidth_bps > 0,   "bandwidth_bps must be non-zero; resolve to seller's bound before calling buy_listing");
+
+    // Fetch listing to validate granularity alignment before submitting the transaction.
+    let listing: ServiceListing = get_object_bcs(&mut client, listing_obj_id).await?;
+    let duration_ms = end_ms - start_ms;
+    let tg = listing.time_granularity;
+    let bg = listing.bw_granularity;
+    anyhow::ensure!(
+        tg == 0 || duration_ms % tg == 0,
+        "duration {duration_ms} ms is not aligned to listing time_granularity {tg} ms \
+         (nearest lower end_ms: {})",
+        start_ms + (duration_ms / tg) * tg
+    );
+    anyhow::ensure!(
+        bg == 0 || bandwidth_bps % bg == 0,
+        "bandwidth {bandwidth_bps} B/s is not aligned to listing bw_granularity {bg} B/s \
+         (nearest lower value: {})",
+        (bandwidth_bps / bg) * bg
+    );
 
     // Pass gas coin as payment — move_call will split price_mist from it.
     let mut builder = TransactionBuilder::new();
     builder.set_sender(wallet.address);
-    builder.set_gas_budget(GAS_BUDGET);
+    builder.set_gas_budget(cfg.sui.gas_budget);
 
     let gas_coin  = builder.gas();
-    let mp        = builder.object(ObjectInput::new(marketplace_addr()?));
+    let mp        = builder.object(ObjectInput::new(marketplace_addr(&cfg)?));
     let id_arg    = builder.pure(&listing_obj_id.into_inner()); // ID = [u8;32]
     let start_arg = builder.pure(&start_ms);
     let end_arg   = builder.pure(&end_ms);
@@ -449,11 +477,11 @@ pub async fn buy_listing(
 
     builder.move_call(
         Function::new(
-            package_addr()?,
+            package_addr(&cfg)?,
             Identifier::new("marketplace").unwrap(),
             Identifier::new("purchase").unwrap(),
         )
-        .with_type_args(vec![coin_type_tag()?]),
+        .with_type_args(vec![coin_type_tag(&cfg)?]),
         vec![mp, id_arg, gas_coin, start_arg, end_arg, bw_arg],
     );
 
@@ -471,8 +499,8 @@ pub async fn buy_listing(
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub async fn redeem(token_id: String, ip_address: String) -> Result<()> {
-    let wallet = crate::utils::load_wallet()?;
-    let mut client = build_client(&wallet)?;
+    let (cfg, wallet) = load_ctx()?;
+    let mut client = build_client(&cfg)?;
     let token_addr: Address = token_id.parse().context("Invalid token ID")?;
 
     // Fetch service name for display before the token is destroyed.
@@ -482,14 +510,14 @@ pub async fn redeem(token_id: String, ip_address: String) -> Result<()> {
 
     let mut builder = TransactionBuilder::new();
     builder.set_sender(wallet.address);
-    builder.set_gas_budget(GAS_BUDGET);
+    builder.set_gas_budget(cfg.sui.gas_budget);
 
     let token_arg = builder.object(ObjectInput::new(token_addr));
     let ip_arg    = builder.pure(&ip_address.into_bytes());
 
     builder.move_call(
         Function::new(
-            package_addr()?,
+            package_addr(&cfg)?,
             Identifier::new("marketplace").unwrap(),
             Identifier::new("redeem").unwrap(),
         )

@@ -1,0 +1,12 @@
+[Sui]
+network         = "testnet"
+rpc_url         = "https://fullnode.testnet.sui.io:443"
+gas_budget      = 50000000
+keystore        = "\\\\wsl.localhost\\Ubuntu\\home\\frentsch\\.sui\\sui_config"
+address         = "0xf71483ddbe609e52ef0ec5a0030f16b73f4a2831c9e84b4e559f4b240d5a0d76"
+
+[Marketplace]
+package_id      = "0x16c820f39b159f91a10acb9dcf2e9b12b3d1ba855b7f49d9221574b44fa3cd91"
+marketplace_id  = "0x6105d1937ce316c44aa02e2da7a4e6e621605e9b97e2280d0513998a6f540d99"
+coin_type      = "0x2::sui::SUI"
+

@@ -10,7 +10,6 @@
 ///   - `bool`    → 1 byte
 ///   - nested struct → fields serialised inline (no tag)
 use serde::Deserialize;
-use sui_sdk::TypeTag;
 
 /// A 32-byte SUI address/object-ID as used in BCS.
 /// Covers Move `address`, `ID { bytes: address }`, and `UID { id: ID }`.
@@ -55,10 +54,10 @@ pub struct ObjectBagRef {
 }
 
 /// `Marketplace<phantom COIN>` layout.
+/// Phantom type parameters are not stored in BCS — only `id` and `listings` appear.
 #[derive(Deserialize, Debug)]
 pub struct MarketplaceObject {
     pub id:       RawId,
-    pub cointype: TypeTag
     pub listings: ObjectBagRef,
 }
 

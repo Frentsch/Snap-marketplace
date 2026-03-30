@@ -1,3 +1,4 @@
+use cli::config;
 use cli::marketplace;
 use cli::utils;
 use anyhow::{Context, Result};
@@ -157,8 +158,35 @@ async fn main() -> Result<()> {
         }
 
         Commands::BuyListing { listing_id, start_date, end_date, bandwidth_bps } => {
-            let start_ms = start_date.as_deref().map(parse_date_ms).transpose()?.unwrap_or(0);
-            let end_ms   = end_date.as_deref().map(parse_date_ms).transpose()?.unwrap_or(0);
+            let start_ms_given = start_date.as_deref().map(parse_date_ms).transpose()?;
+            let end_ms_given   = end_date.as_deref().map(parse_date_ms).transpose()?;
+
+            // Always fetch the listing — needed for defaults and granularity alignment.
+            let listing = marketplace::get_listing(&listing_id).await?;
+            let now_ms  = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .context("System clock before UNIX epoch")?
+                .as_millis() as u64;
+
+            let start_ms  = start_ms_given.unwrap_or(now_ms);
+            let end_ms_raw = end_ms_given.unwrap_or(listing.token.expires_at_ms);
+            let bw_raw    = if bandwidth_bps == 0 { listing.token.bandwidth_bps } else { bandwidth_bps };
+
+            // Align duration down to the nearest multiple of time_granularity.
+            let duration_ms = end_ms_raw.saturating_sub(start_ms);
+            let end_ms = if listing.time_granularity > 0 {
+                start_ms + (duration_ms / listing.time_granularity) * listing.time_granularity
+            } else {
+                end_ms_raw
+            };
+
+            // Align bandwidth down to the nearest multiple of bw_granularity.
+            let bandwidth_bps = if listing.bw_granularity > 0 {
+                (bw_raw / listing.bw_granularity) * listing.bw_granularity
+            } else {
+                bw_raw
+            };
+
             marketplace::buy_listing(listing_id, start_ms, end_ms, bandwidth_bps).await?;
         }
 
@@ -167,8 +195,9 @@ async fn main() -> Result<()> {
         }
 
         Commands::GetWallet {} => {
-            let mut w = utils::get_wallet().await?;
-            println!("Active address: {}", w.active_address()?);
+            let cfg = config::load_config()?;
+            let w = utils::load_wallet(&cfg)?;
+            println!("Active address: {}", w.active_address());
         }
     }
 

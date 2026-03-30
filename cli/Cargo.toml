@@ -16,6 +16,7 @@ bcs        = "0.1"
 futures    = "0.3"
 ipnet      = "2"
 dirs       = "5"
+toml       = "0.8"
 
 # sui-rust-sdk — new modular SDK
 sui-sdk-types           = { git = "https://github.com/mystenlabs/sui-rust-sdk", package = "sui-sdk-types",           features = ["hash"] }
