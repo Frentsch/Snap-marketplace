@@ -207,19 +207,20 @@ async fn main() -> Result<()> {
         "Creating listing '{}' at {} ({} kB/s, {} s → {} s)",
         args.name, args.listen, max_bandwidth, valid_from, expires_at
     );
-    let listing_id = cli::marketplace::create_listing(
-        args.name.clone(),
-        args.listen.clone(),
-        args.price_sui,
-        valid_from,
-        expires_at,
-        max_bandwidth,
-        min_bandwidth,
-        min_duration,
-        bw_granularity,
-        time_granularity,
-    )
-    .await?;
+    let listing_id = cli::marketplace::MarketplaceClient::new()?
+        .create_listing(
+            args.name.clone(),
+            args.listen.clone(),
+            args.price_sui,
+            valid_from,
+            expires_at,
+            max_bandwidth,
+            min_bandwidth,
+            min_duration,
+            bw_granularity,
+            time_granularity,
+        )
+        .await?;
     println!("Listing ID: {listing_id}");
 
     // 4. Shared authorized-IP set.

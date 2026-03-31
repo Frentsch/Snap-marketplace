@@ -1,5 +1,5 @@
 use cli::config;
-use cli::marketplace;
+use cli::marketplace::MarketplaceClient;
 use cli::utils;
 use anyhow::{Context, Result};
 use chrono::NaiveDateTime;
@@ -139,7 +139,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::CreateMarketplace {} => {
-            marketplace::create_marketplace().await?;
+            MarketplaceClient::new()?.create_marketplace().await?;
         }
 
         Commands::CreateListing { name, ip_address, price_sui, valid_from, expires_at, max_bandwidth, min_bandwidth, min_duration, bw_granularity, time_granularity } => {
@@ -147,7 +147,7 @@ async fn main() -> Result<()> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .context("System clock before UNIX epoch")?
                 .as_secs();
-            marketplace::create_listing(
+            MarketplaceClient::new()?.create_listing(
                 name,
                 ip_address,
                 price_sui,
@@ -162,21 +162,23 @@ async fn main() -> Result<()> {
         }
 
         Commands::GetListings { limit } => {
-            marketplace::get_listings(limit).await?;
+            MarketplaceClient::new()?.get_listings(limit).await?;
         }
 
         Commands::SearchListings { subnet, bandwidth, start_date, end_date } => {
             let start = start_date.as_deref().map(parse_date).transpose()?.unwrap_or(0);
             let end   = end_date.as_deref().map(parse_date).transpose()?.unwrap_or(0);
-            marketplace::search_listings(&subnet, bandwidth, start, end).await?;
+            MarketplaceClient::new()?.search_listings(&subnet, bandwidth, start, end).await?;
         }
 
         Commands::BuyListing { listing_id, start_date, end_date, bandwidth } => {
             let start_given = start_date.as_deref().map(parse_date).transpose()?;
             let end_given   = end_date.as_deref().map(parse_date).transpose()?;
 
-            // Always fetch the listing — needed for defaults and granularity alignment.
-            let listing = marketplace::get_listing(&listing_id).await?;
+            let mut mc = MarketplaceClient::new()?;
+
+            // Fetch listing for defaults and granularity alignment.
+            let listing = mc.get_listing(&listing_id).await?;
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .context("System clock before UNIX epoch")?
@@ -186,26 +188,23 @@ async fn main() -> Result<()> {
             let end_raw = end_given.unwrap_or(listing.token.expires_at);
             let bw_raw  = if bandwidth == 0 { listing.token.bandwidth } else { bandwidth };
 
-            // Align duration down to the nearest multiple of time_granularity.
             let duration = end_raw.saturating_sub(start);
             let end = if listing.time_granularity > 0 {
                 start + (duration / listing.time_granularity) * listing.time_granularity
             } else {
                 end_raw
             };
-
-            // Align bandwidth down to the nearest multiple of bw_granularity.
             let bw = if listing.bw_granularity > 0 {
                 (bw_raw / listing.bw_granularity) * listing.bw_granularity
             } else {
                 bw_raw
             };
 
-            marketplace::buy_listing(listing_id, start, end, bw).await?;
+            mc.buy_listing(listing_id, start, end, bw).await?;
         }
 
         Commands::Redeem { token_id, ip_address } => {
-            marketplace::redeem(token_id, ip_address).await?;
+            MarketplaceClient::new()?.redeem(token_id, ip_address).await?;
         }
 
         Commands::GetWallet {} => {

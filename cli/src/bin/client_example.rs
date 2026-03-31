@@ -42,7 +42,8 @@ async fn main() -> Result<()> {
     // 1. Fetch listing BEFORE buying — purchase removes it from the marketplace.
     //    Also resolve any 0-defaults using the seller's bounds.
     println!("Fetching listing metadata…");
-    let listing = cli::marketplace::get_listing(&args.listing_id).await?;
+    let mut mc = cli::marketplace::MarketplaceClient::new()?;
+    let listing = mc.get_listing(&args.listing_id).await?;
     let server_addr = listing.ip_address.clone();
     println!("Service address: {server_addr}");
 
@@ -71,11 +72,11 @@ async fn main() -> Result<()> {
     };
     // 2. Buy the listing → receive an AccessToken.
     println!("Buying listing {}…", args.listing_id);
-    let token_id = cli::marketplace::buy_listing(args.listing_id.clone(), start, end, bw).await?;
+    let token_id = mc.buy_listing(args.listing_id.clone(), start, end, bw).await?;
 
     // 3. Redeem the token, recording our IP so the server will authorize us.
     println!("Redeeming token {token_id} with IP {}…", args.ip);
-    cli::marketplace::redeem(token_id.to_string(), args.ip.clone()).await?;
+    mc.redeem(token_id.to_string(), args.ip.clone()).await?;
 
     // 4. Retry until the service_provider's event poller has processed the
     //    redemption and authorized our IP (poller runs every 3s).
