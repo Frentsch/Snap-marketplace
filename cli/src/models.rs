@@ -6,8 +6,7 @@ pub type RawId = [u8; 32];
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct AccessToken {
-    pub id:          RawId,
-    pub listing_id:  RawId,
+    pub id:           RawId,
     pub service_name: String,
     pub ip_address:  String,
     pub valid_from:  u64,
@@ -20,10 +19,7 @@ pub struct AccessToken {
 pub struct ServiceListing {
     pub id:               RawId,
     pub issuer:           RawId,
-    pub name:             String,
-    pub ip_address:       String,
     pub price_mist:       u64,
-    pub is_active:        bool,
     pub min_bandwidth:    u64,
     pub min_duration:     u64,
     pub bw_granularity:   u64,
@@ -48,7 +44,8 @@ pub struct TokenRedeemed {
     pub token_id:    RawId,
     pub issuer:      RawId,
     pub redeemed_by: RawId,
-    pub ip_address:  String,
+    pub service_ip:  String,
+    pub client_ip:   String,
     pub valid_from:  u64,
     pub expires_at:  u64,
     pub bandwidth:   u64,

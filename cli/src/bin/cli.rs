@@ -18,8 +18,8 @@ enum Commands {
     /// Deploy a new Marketplace shared object for the configured coin type
     CreateMarketplace {},
 
-    /// Create a new service listing on the marketplace
-    CreateListing {
+    /// Create an AccessToken for a service (step 1 of listing flow)
+    CreateAccessToken {
         /// Human-readable service name
         #[arg(long)]
         name: String,
@@ -27,10 +27,6 @@ enum Commands {
         /// IP address or host:port of the service endpoint
         #[arg(long)]
         ip_address: String,
-
-        /// Price per access grant in SUI (e.g. 0.5)
-        #[arg(long)]
-        price_sui: f64,
 
         /// Earliest time buyers may set as their start, as Unix seconds timestamp; 0 = now
         #[arg(long, default_value = "0")]
@@ -43,6 +39,16 @@ enum Commands {
         /// Maximum bandwidth buyers may request in kB/s
         #[arg(long, default_value = "1000")]
         max_bandwidth: u64,
+    },
+
+    /// Wrap an AccessToken into a marketplace listing (step 2 of listing flow)
+    CreateListing {
+        /// Object ID of the AccessToken to list
+        token_id: String,
+
+        /// Price per access grant in SUI (e.g. 0.5)
+        #[arg(long)]
+        price_sui: f64,
 
         /// Minimum bandwidth buyers must purchase in kB/s
         #[arg(long, default_value = "1")]
@@ -142,22 +148,23 @@ async fn main() -> Result<()> {
             MarketplaceClient::new()?.create_marketplace().await?;
         }
 
-        Commands::CreateListing { name, ip_address, price_sui, valid_from, expires_at, max_bandwidth, min_bandwidth, min_duration, bw_granularity, time_granularity } => {
+        Commands::CreateAccessToken { name, ip_address, valid_from, expires_at, max_bandwidth } => {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .context("System clock before UNIX epoch")?
                 .as_secs();
-            MarketplaceClient::new()?.create_listing(
+            MarketplaceClient::new()?.create_access_token(
                 name,
                 ip_address,
-                price_sui,
                 if valid_from == 0 { now }         else { valid_from },
                 if expires_at == 0 { now + 3_600 } else { expires_at },
                 max_bandwidth,
-                min_bandwidth,
-                min_duration,
-                bw_granularity,
-                time_granularity,
+            ).await?;
+        }
+
+        Commands::CreateListing { token_id, price_sui, min_bandwidth, min_duration, bw_granularity, time_granularity } => {
+            MarketplaceClient::new()?.create_listing(
+                token_id, price_sui, min_bandwidth, min_duration, bw_granularity, time_granularity,
             ).await?;
         }
 

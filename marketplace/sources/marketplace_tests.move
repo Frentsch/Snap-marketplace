@@ -3,7 +3,8 @@ module marketplace::marketplace_tests;
     use sui::test_scenario::{Self, Scenario};
     use sui::coin;
     use sui::sui::SUI;
-    use marketplace::marketplace::{Self, Marketplace, AccessToken};
+    use marketplace::marketplace::{Self, Marketplace};
+    use marketplace::access_token::{Self, AccessToken};
 
     const SELLER: address = @0xA;
     const BUYER:  address = @0xB;
@@ -27,15 +28,25 @@ module marketplace::marketplace_tests;
         marketplace::create_marketplace<SUI>(test_scenario::ctx(scenario));
     }
 
-    fun create_test_listing(mp: &mut Marketplace<SUI>, scenario: &mut Scenario): ID {
-        marketplace::create_listing(
-            mp,
+    /// Step 1: create an AccessToken owned by the current sender.
+    fun create_test_token(scenario: &mut Scenario) {
+        access_token::create_access_token(
             b"My Service",
             b"127.0.0.1:8080",
-            PRICE_MIST,
             0,
             SELLER_EXPIRES_AT,
             SELLER_BANDWIDTH,
+            test_scenario::ctx(scenario),
+        );
+    }
+
+    /// Step 2: take the AccessToken from sender's inventory and wrap it in a listing.
+    fun create_test_listing(mp: &mut Marketplace<SUI>, scenario: &mut Scenario): ID {
+        let token = test_scenario::take_from_sender<AccessToken>(scenario);
+        marketplace::create_listing(
+            mp,
+            token,
+            PRICE_MIST,
             MIN_BANDWIDTH,
             MIN_DURATION,
             BW_GRANULARITY,
@@ -51,12 +62,17 @@ module marketplace::marketplace_tests;
     fun test_create_listing() {
         let mut scenario = test_scenario::begin(SELLER);
         setup(&mut scenario);
+
+        test_scenario::next_tx(&mut scenario, SELLER);
+        { create_test_token(&mut scenario); };
+
         test_scenario::next_tx(&mut scenario, SELLER);
         {
             let mut mp = test_scenario::take_shared<Marketplace<SUI>>(&scenario);
             create_test_listing(&mut mp, &mut scenario);
             test_scenario::return_shared(mp);
         };
+
         test_scenario::end(scenario);
     }
 
@@ -67,6 +83,9 @@ module marketplace::marketplace_tests;
     fun test_purchase() {
         let mut scenario = test_scenario::begin(SELLER);
         setup(&mut scenario);
+
+        test_scenario::next_tx(&mut scenario, SELLER);
+        { create_test_token(&mut scenario); };
 
         test_scenario::next_tx(&mut scenario, SELLER);
         let listing_id = {
@@ -89,9 +108,8 @@ module marketplace::marketplace_tests;
         test_scenario::next_tx(&mut scenario, BUYER);
         {
             let token = test_scenario::take_from_sender<AccessToken>(&scenario);
-            assert!(marketplace::token_listing_id(&token) == listing_id, 0);
-            assert!(marketplace::token_expires_at(&token) == BUYER_END, 1);
-            assert!(marketplace::token_bandwidth(&token) == BUYER_BANDWIDTH, 2);
+            assert!(access_token::expires_at(&token) == BUYER_END, 0);
+            assert!(access_token::bandwidth(&token)  == BUYER_BANDWIDTH, 1);
             test_scenario::return_to_sender(&scenario, token);
         };
 
@@ -99,49 +117,16 @@ module marketplace::marketplace_tests;
     }
 
     // =========================================================
-    // Test 3: purchase fails when listing is inactive
-    // =========================================================
-    #[test]
-    #[expected_failure(abort_code = marketplace::EListingNotActive)]
-    fun test_purchase_inactive_listing() {
-        let mut scenario = test_scenario::begin(SELLER);
-        setup(&mut scenario);
-
-        test_scenario::next_tx(&mut scenario, SELLER);
-        let listing_id = {
-            let mut mp = test_scenario::take_shared<Marketplace<SUI>>(&scenario);
-            let id = create_test_listing(&mut mp, &mut scenario);
-            test_scenario::return_shared(mp);
-            id
-        };
-
-        test_scenario::next_tx(&mut scenario, SELLER);
-        {
-            let mut mp = test_scenario::take_shared<Marketplace<SUI>>(&scenario);
-            marketplace::update_listing(&mut mp, listing_id, PRICE_MIST, false, test_scenario::ctx(&mut scenario));
-            test_scenario::return_shared(mp);
-        };
-
-        test_scenario::next_tx(&mut scenario, BUYER);
-        {
-            let mut mp = test_scenario::take_shared<Marketplace<SUI>>(&scenario);
-            let mut payment = coin::mint_for_testing<SUI>(1_000_000_000, test_scenario::ctx(&mut scenario));
-            marketplace::purchase(&mut mp, listing_id, &mut payment, BUYER_START, BUYER_END, BUYER_BANDWIDTH, test_scenario::ctx(&mut scenario));
-            coin::burn_for_testing(payment);
-            test_scenario::return_shared(mp);
-        };
-
-        test_scenario::end(scenario);
-    }
-
-    // =========================================================
-    // Test 4: purchase fails with insufficient payment
+    // Test 3: purchase fails with insufficient payment
     // =========================================================
     #[test]
     #[expected_failure(abort_code = marketplace::EInsufficientPayment)]
     fun test_purchase_insufficient_payment() {
         let mut scenario = test_scenario::begin(SELLER);
         setup(&mut scenario);
+
+        test_scenario::next_tx(&mut scenario, SELLER);
+        { create_test_token(&mut scenario); };
 
         test_scenario::next_tx(&mut scenario, SELLER);
         let listing_id = {
@@ -170,6 +155,9 @@ module marketplace::marketplace_tests;
     fun test_redeem() {
         let mut scenario = test_scenario::begin(SELLER);
         setup(&mut scenario);
+
+        test_scenario::next_tx(&mut scenario, SELLER);
+        { create_test_token(&mut scenario); };
 
         test_scenario::next_tx(&mut scenario, SELLER);
         let listing_id = {
@@ -205,6 +193,9 @@ module marketplace::marketplace_tests;
     fun test_delist_prevents_purchase() {
         let mut scenario = test_scenario::begin(SELLER);
         setup(&mut scenario);
+
+        test_scenario::next_tx(&mut scenario, SELLER);
+        { create_test_token(&mut scenario); };
 
         test_scenario::next_tx(&mut scenario, SELLER);
         let listing_id = {
@@ -243,6 +234,9 @@ module marketplace::marketplace_tests;
         setup(&mut scenario);
 
         test_scenario::next_tx(&mut scenario, SELLER);
+        { create_test_token(&mut scenario); };
+
+        test_scenario::next_tx(&mut scenario, SELLER);
         let listing_id = {
             let mut mp = test_scenario::take_shared<Marketplace<SUI>>(&scenario);
             let id = create_test_listing(&mut mp, &mut scenario);
@@ -270,6 +264,9 @@ module marketplace::marketplace_tests;
     fun test_bandwidth_out_of_bounds() {
         let mut scenario = test_scenario::begin(SELLER);
         setup(&mut scenario);
+
+        test_scenario::next_tx(&mut scenario, SELLER);
+        { create_test_token(&mut scenario); };
 
         test_scenario::next_tx(&mut scenario, SELLER);
         let listing_id = {

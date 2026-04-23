@@ -70,6 +70,7 @@ struct Args {
 async fn event_loop(
     rpc_url: String,
     issuer_address: Address,
+    service_ip: String,
     authorized: Arc<RwLock<HashSet<String>>>,
 ) -> Result<()> {
     let mut client = Client::new(rpc_url.as_str())
@@ -85,7 +86,7 @@ async fn event_loop(
         .context("subscribe_checkpoints failed")?
         .into_inner();
 
-    println!("Subscribed to checkpoints — watching for redemptions issued by {issuer_address}");
+    println!("Subscribed to checkpoints — watching for redemptions for {service_ip} issued by {issuer_address}");
 
     while let Some(item) = stream.next().await {
         let response = item.context("Checkpoint stream error")?;
@@ -105,7 +106,7 @@ async fn event_loop(
                     Some(t) => t,
                     None => continue,
                 };
-                if !event_type.contains("::marketplace::TokenRedeemed") {
+                if !event_type.contains("::access_token::TokenRedeemed") {
                     continue;
                 }
 
@@ -118,17 +119,20 @@ async fn event_loop(
                 };
 
                 match bcs::from_bytes::<TokenRedeemed>(bcs_bytes.as_ref()) {
-                    Ok(redeemed) if Address::new(redeemed.issuer) == issuer_address => {
+                    Ok(redeemed)
+                        if Address::new(redeemed.issuer) == issuer_address
+                            && redeemed.service_ip == service_ip =>
+                    {
                         println!(
                             "Redemption received — authorizing IP: {}  ({} kB/s, {} s → {} s)",
-                            redeemed.ip_address,
+                            redeemed.client_ip,
                             redeemed.bandwidth,
                             redeemed.valid_from,
                             redeemed.expires_at,
                         );
-                        authorized.write().await.insert(redeemed.ip_address.clone());
+                        authorized.write().await.insert(redeemed.client_ip.clone());
                     }
-                    Ok(_) => {} // different issuer — not our token
+                    Ok(r) => {println!("Other redemtpion for {}", r.client_ip)} // different issuer or service — not our token
                     Err(e) => eprintln!("Warning: failed to deserialize TokenRedeemed: {e}"),
                 }
             }
@@ -202,32 +206,36 @@ async fn main() -> Result<()> {
     let issuer_address = wallet.active_address();
     let rpc_url = cfg.sui.rpc_url.clone();
 
-    // 3. Create the marketplace listing with ip_address = listen address.
+    // 3. Create access token, then list it.
     println!(
-        "Creating listing '{}' at {} ({} kB/s, {} s → {} s)",
+        "Creating access token for '{}' at {} ({} kB/s, {} s → {} s)",
         args.name, args.listen, max_bandwidth, valid_from, expires_at
     );
-    let listing_id = cli::marketplace::MarketplaceClient::new()?
-        .create_listing(
-            args.name.clone(),
-            args.listen.clone(),
-            args.price_sui,
-            valid_from,
-            expires_at,
-            max_bandwidth,
-            min_bandwidth,
-            min_duration,
-            bw_granularity,
-            time_granularity,
-        )
-        .await?;
+    let mut mc = cli::marketplace::MarketplaceClient::new()?;
+    let token_id = mc.create_access_token(
+        args.name.clone(),
+        args.listen.clone(),
+        valid_from,
+        expires_at,
+        max_bandwidth,
+    ).await?;
+
+    println!("Listing token {}…", token_id);
+    let listing_id = mc.create_listing(
+        token_id.to_string(),
+        args.price_sui,
+        min_bandwidth,
+        min_duration,
+        bw_granularity,
+        time_granularity,
+    ).await?;
     println!("Listing ID: {listing_id}");
 
     // 4. Shared authorized-IP set.
     let authorized: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
 
     // 5. Spawn checkpoint subscription in the background.
-    tokio::spawn(event_loop(rpc_url, issuer_address, authorized.clone()));
+    tokio::spawn(event_loop(rpc_url, issuer_address, args.listen.clone(), authorized.clone()));
 
     // 6. Run TCP listener (blocks until error).
     tcp_listener_loop(&args.listen, authorized).await

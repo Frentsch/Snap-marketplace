@@ -82,7 +82,7 @@ impl MarketplaceClient {
         Ok(Address::new(mp.listings.id))
     }
 
-    async fn list_listing_ids(&self, bag_id: Address) -> Result<Vec<Address>> {
+    async fn get_listing_ids(&self, bag_id: Address) -> Result<Vec<Address>> {
         let stream = self.client.list_dynamic_fields(
             ListDynamicFieldsRequest::default()
                 .with_parent(bag_id.to_string())
@@ -105,9 +105,10 @@ impl MarketplaceClient {
 
     async fn execute(
         &mut self,
-        fn_name:   &str,
-        type_args: Vec<TypeTag>,
-        call_args: Vec<CallArg>,
+        module_name: &str,
+        fn_name:     &str,
+        type_args:   Vec<TypeTag>,
+        call_args:   Vec<CallArg>,
     ) -> Result<TransactionEffects> {
         let mut builder = TransactionBuilder::new();
         builder.set_sender(self.wallet.address);
@@ -124,7 +125,7 @@ impl MarketplaceClient {
         builder.move_call(
             Function::new(
                 self.cfg.marketplace.package_id,
-                Identifier::new("marketplace").unwrap(),
+                Identifier::new(module_name).unwrap(),
                 Identifier::new(fn_name).unwrap(),
             )
             .with_type_args(type_args),
@@ -169,7 +170,7 @@ impl MarketplaceClient {
 
     pub async fn create_marketplace(&mut self) -> Result<Address> {
         let type_args = vec![self.coin_type_tag()?];
-        let effects = self.execute("create_marketplace", type_args, vec![]).await?;
+        let effects = self.execute("marketplace", "create_marketplace", type_args, vec![]).await?;
         let mp_id   = find_created(&effects, "::marketplace::Marketplace")?;
 
         println!("Marketplace created!");
@@ -179,30 +180,48 @@ impl MarketplaceClient {
         Ok(mp_id)
     }
 
-    pub async fn create_listing(
+    pub async fn create_access_token(
         &mut self,
         name: String,
         ip_address: String,
-        price_sui: f64,
         valid_from: u64,
         expires_at: u64,
         max_bandwidth: u64,
+    ) -> Result<Address> {
+        let effects = self.execute("access_token", "create_access_token", vec![], vec![
+            CallArg::Bytes(name.into_bytes()),
+            CallArg::Bytes(ip_address.into_bytes()),
+            CallArg::U64(valid_from),
+            CallArg::U64(expires_at),
+            CallArg::U64(max_bandwidth),
+        ]).await?;
+        let token_id = find_created(&effects, "::access_token::AccessToken")?;
+
+        println!("Access token created!");
+        println!("  Token ID:   {token_id}");
+        println!("  Valid from: {valid_from} s");
+        println!("  Expires at: {expires_at} s");
+        println!("  Max BW:     {max_bandwidth} kB/s");
+        Ok(token_id)
+    }
+
+    pub async fn create_listing(
+        &mut self,
+        token_id: String,
+        price_sui: f64,
         min_bandwidth: u64,
         min_duration: u64,
         bw_granularity: u64,
         time_granularity: u64,
     ) -> Result<Address> {
         let price_mist = (price_sui * 1_000_000_000.0) as u64;
-        let mp_id      = self.cfg.marketplace.marketplace_id;
-        let type_args  = vec![self.coin_type_tag()?];
-        let effects = self.execute("create_listing", type_args, vec![
+        let token_addr: Address = token_id.parse().context("Invalid token ID")?;
+        let mp_id     = self.cfg.marketplace.marketplace_id;
+        let type_args = vec![self.coin_type_tag()?];
+        let effects = self.execute("marketplace", "create_listing", type_args, vec![
             CallArg::Object(mp_id),
-            CallArg::Bytes(name.into_bytes()),
-            CallArg::Bytes(ip_address.into_bytes()),
+            CallArg::Object(token_addr),
             CallArg::U64(price_mist),
-            CallArg::U64(valid_from),
-            CallArg::U64(expires_at),
-            CallArg::U64(max_bandwidth),
             CallArg::U64(min_bandwidth),
             CallArg::U64(min_duration),
             CallArg::U64(bw_granularity),
@@ -212,10 +231,8 @@ impl MarketplaceClient {
 
         println!("Listing created!");
         println!("  Listing:        {listing_id}");
+        println!("  Token:          {token_id}");
         println!("  Price:          {price_sui} SUI");
-        println!("  Valid from:     {valid_from} s");
-        println!("  Expires at:     {expires_at} s");
-        println!("  Max BW:         {max_bandwidth} kB/s");
         println!("  Min BW:         {min_bandwidth} kB/s");
         println!("  Min duration:   {min_duration} s");
         println!("  BW granularity: {bw_granularity} kB/s");
@@ -225,7 +242,7 @@ impl MarketplaceClient {
 
     pub async fn get_listings(&mut self, limit: u32) -> Result<()> {
         let bag_id = self.get_bag_id().await?;
-        let mut ids = self.list_listing_ids(bag_id).await?;
+        let mut ids = self.get_listing_ids(bag_id).await?;
         ids.truncate(limit as usize);
 
         if ids.is_empty() {
@@ -254,7 +271,7 @@ impl MarketplaceClient {
             };
             println!(
                 "{id:<68}  {price:>10.4}  {}  (expires: {} s, bw: {bw})",
-                l.name, l.token.expires_at
+                l.token.service_name, l.token.expires_at
             );
         }
         println!("\n{} listing(s) shown.", listings.len());
@@ -277,7 +294,7 @@ impl MarketplaceClient {
             .with_context(|| format!("Invalid subnet '{subnet}'"))?;
 
         let bag_id = self.get_bag_id().await?;
-        let ids    = self.list_listing_ids(bag_id).await?;
+        let ids    = self.get_listing_ids(bag_id).await?;
 
         if ids.is_empty() {
             println!("No listings found.");
@@ -301,7 +318,7 @@ impl MarketplaceClient {
                 Err(e) => { eprintln!("Warning: {e}"); continue; }
             };
 
-            let host = l.ip_address.rsplit_once(':').map(|(h, _)| h).unwrap_or(&l.ip_address);
+            let host = l.token.ip_address.rsplit_once(':').map(|(h, _)| h).unwrap_or(&l.token.ip_address);
             if let Ok(ip) = IpAddr::from_str(host) {
                 if !filter_net.contains(&ip) { continue; }
             }
@@ -311,9 +328,9 @@ impl MarketplaceClient {
 
             rows.push(Row {
                 id,
-                name:       l.name.clone(),
+                name:       l.token.service_name.clone(),
                 price_mist: l.price_mist,
-                ip_address: l.ip_address.clone(),
+                ip_address: l.token.ip_address.clone(),
                 valid_from: l.token.valid_from,
                 expires_at: l.token.expires_at,
                 bandwidth:  l.token.bandwidth,
@@ -378,7 +395,7 @@ impl MarketplaceClient {
         let mp_id     = self.cfg.marketplace.marketplace_id;
         let id_bytes  = listing_obj_id.into_inner();
         let type_args = vec![self.coin_type_tag()?];
-        let effects = self.execute("purchase", type_args, vec![
+        let effects = self.execute("marketplace", "purchase", type_args, vec![
             CallArg::Object(mp_id),
             CallArg::Id(id_bytes),
             CallArg::Gas,
@@ -401,7 +418,7 @@ impl MarketplaceClient {
         let service_name = token.service_name.clone();
         println!("Redeeming token for '{service_name}'…");
 
-        self.execute("redeem", vec![], vec![
+        self.execute("access_token", "redeem", vec![], vec![
             CallArg::Object(token_addr),
             CallArg::Bytes(ip_address.into_bytes()),
         ]).await?;
@@ -422,7 +439,7 @@ fn find_created(effects: &TransactionEffects, type_suffix: &str) -> Result<Addre
         .iter()
         .find(|co| {
             co.object_type_opt()
-                .map_or(false, |t: &str| t.ends_with(type_suffix))
+                .map_or(false, |t: &str| t.contains(type_suffix))
                 && co.id_operation
                     .and_then(|v| changed_object::IdOperation::try_from(v).ok())
                     == Some(changed_object::IdOperation::Created)
@@ -438,7 +455,7 @@ fn find_access_token(effects: &TransactionEffects) -> Result<Address> {
         .iter()
         .find(|co| {
             co.object_type_opt()
-                .map_or(false, |t: &str| t.ends_with("::marketplace::AccessToken"))
+                .map_or(false, |t: &str| t.contains("::access_token::AccessToken"))
         })
         .and_then(|co| co.object_id_opt())
         .context("AccessToken not found in transaction effects")

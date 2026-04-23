@@ -44,7 +44,7 @@ async fn main() -> Result<()> {
     println!("Fetching listing metadata…");
     let mut mc = cli::marketplace::MarketplaceClient::new()?;
     let listing = mc.get_listing(&args.listing_id).await?;
-    let server_addr = listing.ip_address.clone();
+    let server_addr = listing.token.ip_address.clone();
     println!("Service address: {server_addr}");
 
     let now = std::time::SystemTime::now()
