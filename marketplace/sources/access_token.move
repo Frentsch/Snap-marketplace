@@ -33,15 +33,48 @@ module marketplace::access_token;
         issuer:       address,
     }
 
-        public struct TokenRedeemed has copy, drop {
-        token_id:    ID,
-        issuer:      address,
-        redeemed_by: address,
-        service_ip:  String, // seller's service endpoint — identifies which server this token is for
-        client_ip:   String, // buyer's IP address recorded at redemption time
-        valid_from:  u64,
-        expires_at:  u64,
-        bandwidth:   u64,
+    /// Capability object transferred to the issuer on redemption.
+    /// The original AccessToken is wrapped inside so all its metadata is
+    /// preserved until deliver_redemption, where it is unpacked and deleted.
+    public struct RedemptionRequest has key {
+        id:            UID,
+        token_id:      ID,           // kept for backward-compatible event matching
+        redeemed_by:   address,
+        client_pubkey: vector<u8>,   // flag_byte || raw_pubkey_bytes
+        token:         AccessToken,  // wrapped here; deleted in deliver_redemption
+    }
+
+    public struct TokenRedeemed has copy, drop {
+        token_id:      ID,
+        request_id:    ID,           // ID of the RedemptionRequest object
+        issuer:        address,
+        redeemed_by:   address,
+        service_ip:    String,
+        client_pubkey: vector<u8>,   // flag_byte || raw_pubkey_bytes
+        valid_from:    u64,
+        expires_at:    u64,
+        bandwidth:     u64,
+    }
+
+    public struct RedemptionDelivery has copy, drop {
+        token_id:           ID,
+        redeemed_by:        address,
+        encrypted_auth_key: vector<u8>,
+    }
+
+    /// Persistent proof of a completed redemption, held by the buyer.
+    /// Contains all AccessToken service fields so the front end has full
+    /// context without needing to scrape past events.
+    public struct AccessKey has key, store {
+        id:           UID,
+        token_id:     ID,
+        service_name: String,
+        ip_address:   String,
+        valid_from:   u64,
+        expires_at:   u64,
+        bandwidth:    u64,
+        issuer:       address,
+        auth_key:     vector<u8>,
     }
 
     // =========================================================
@@ -61,22 +94,35 @@ module marketplace::access_token;
         max_bandwidth: u64,
         ctx:           &mut TxContext,
     ): ID {
+        let token = create_access_token_obj(name, ip_address, valid_from, expires_at, max_bandwidth, ctx);
+        let token_id = object::id(&token);
+        transfer::public_transfer(token, ctx.sender());
+        token_id
+    }
+
+    /// PTB-chainable variant: returns the `AccessToken` by value instead of
+    /// transferring it, so it can be passed directly to `marketplace::create_listing`
+    /// in the same transaction block.
+    public fun create_access_token_obj(
+        name:          vector<u8>,
+        ip_address:    vector<u8>,
+        valid_from:    u64,
+        expires_at:    u64,
+        max_bandwidth: u64,
+        ctx:           &mut TxContext,
+    ): AccessToken {
         assert!(expires_at > valid_from, EInvalidInterval);
         assert!(max_bandwidth > 0,       EInvalidBandwidth);
 
-        let token_uid = object::new(ctx);
-        let token_id  = object::uid_to_inner(&token_uid);
-        let token = AccessToken {
-            id:           token_uid,
+        AccessToken {
+            id:           object::new(ctx),
             service_name: string::utf8(name),
             ip_address:   string::utf8(ip_address),
             valid_from,
             expires_at,
-            bandwidth: max_bandwidth,
-            issuer: ctx.sender(),
-        };
-        transfer::public_transfer(token, ctx.sender());
-        token_id
+            bandwidth:    max_bandwidth,
+            issuer:       ctx.sender(),
+        }
     }
 
     // =========================================================
@@ -219,21 +265,74 @@ module marketplace::access_token;
     // =========================================================
 
     public entry fun redeem(
-        token:      AccessToken,
-        ip_address: vector<u8>,
-        ctx:        &TxContext,
+        token:         AccessToken,
+        client_pubkey: vector<u8>,
+        ctx:           &mut TxContext,
     ) {
-        let (token_id, issuer, service_ip, valid_from, expires_at, bandwidth) =
-            burn(token);
+        // Read fields by copy before moving token into the request.
+        // All types (String, u64, address) have the `copy` ability.
+        let token_id   = object::id(&token);
+        let issuer     = token.issuer;
+        let service_ip = token.ip_address;
+        let valid_from = token.valid_from;
+        let expires_at = token.expires_at;
+        let bandwidth  = token.bandwidth;
+
+        let request_uid = object::new(ctx);
+        let request_id  = object::uid_to_inner(&request_uid);
 
         event::emit(TokenRedeemed {
             token_id,
+            request_id,
             issuer,
-            redeemed_by: ctx.sender(),
+            redeemed_by:  ctx.sender(),
             service_ip,
-            client_ip: string::utf8(ip_address),
+            client_pubkey,
             valid_from,
             expires_at,
             bandwidth,
         });
-}
+
+        // Wrap the token instead of burning it so the issuer retains full
+        // service metadata while processing the redemption.
+        transfer::transfer(RedemptionRequest {
+            id:           request_uid,
+            token_id,
+            redeemed_by:  ctx.sender(),
+            client_pubkey,
+            token,
+        }, issuer);
+    }
+
+    public entry fun deliver_redemption(
+        request:            RedemptionRequest,
+        encrypted_auth_key: vector<u8>,
+        ctx:                &mut TxContext,
+    ) {
+        let RedemptionRequest { id, token_id, redeemed_by, client_pubkey: _, token } = request;
+        object::delete(id);
+
+        // Unpack and delete the wrapped AccessToken now that delivery is complete.
+        let AccessToken { id: token_uid, service_name, ip_address, valid_from,
+                          expires_at, bandwidth, issuer } = token;
+        object::delete(token_uid);
+
+        // Keep the event unchanged so existing listeners are unaffected.
+        event::emit(RedemptionDelivery { token_id, redeemed_by, encrypted_auth_key });
+
+        // Transfer a persistent AccessKey with full service metadata to the buyer.
+        transfer::transfer(
+            AccessKey {
+                id: object::new(ctx),
+                token_id,
+                service_name,
+                ip_address,
+                valid_from,
+                expires_at,
+                bandwidth,
+                issuer,
+                auth_key: encrypted_auth_key,
+            },
+            redeemed_by,
+        );
+    }
