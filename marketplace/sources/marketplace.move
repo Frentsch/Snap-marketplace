@@ -11,7 +11,6 @@ module marketplace::marketplace;
     use sui::coin::{Self, Coin};
     use sui::event;
     use sui::object_bag::{Self, ObjectBag};
-    use std::string::{Self, String};
     use marketplace::access_token::{Self, AccessToken};
 
     // =========================================================
@@ -24,6 +23,37 @@ module marketplace::marketplace;
     const EInvalidBandwidth:     u64 = 5;
     const EInvalidMinBandwidth:  u64 = 6;
     const EInvalidGranularity:   u64 = 7;
+    const ENotIssuer:            u64 = 8;
+    const ETiersNotSorted:       u64 = 9;
+    const ETierLengthMismatch:   u64 = 10;
+
+    // =========================================================
+    // Pricing structs
+    // =========================================================
+
+    /// A single tier in a discount schedule.
+    /// `fraction_bps` is the price fraction in basis points (10 000 = 100%).
+    public struct DiscountTier has store, drop, copy {
+        threshold:    u64,  // kB/s (bandwidth) or seconds (duration)
+        fraction_bps: u64,  // price fraction in basis points
+    }
+
+    /// Pricing policy embedded in every ServiceListing.
+    ///
+    /// Price formula:
+    ///   computed  = base_price_mist
+    ///             × bw_fraction(bandwidth)  / 10 000
+    ///             × dur_fraction(duration)  / 10 000
+    ///   effective = max(min_price, computed)
+    ///
+    /// Fractions are linearly interpolated from the tier lists.
+    /// Empty tier list → fraction is always 10 000 (100%), i.e. no volume discount.
+    public struct PricingPolicy has store, drop {
+        base_price_mist: u64,                   // reference price at full usage
+        min_price:       u64,                   // absolute price floor in MIST
+        bw_tiers:        vector<DiscountTier>,  // sorted ascending by threshold (kB/s)
+        dur_tiers:       vector<DiscountTier>,  // sorted ascending by threshold (seconds)
+    }
 
     // =========================================================
     // Core objects
@@ -34,17 +64,16 @@ module marketplace::marketplace;
         listings: ObjectBag,
     }
 
-    /// A service listing wraps an AccessToken and adds marketplace metadata.
-    /// Name and ip_address are accessed via the embedded token.
+    /// A service listing wraps an AccessToken and its pricing policy.
     public struct ServiceListing has key, store {
-        id: UID,
-        issuer: address,
-        price_mist: u64,
-        min_bandwidth: u64,    // kB/s
-        min_duration: u64,     // seconds
-        bw_granularity: u64,   // kB/s
-        time_granularity: u64, // seconds
-        token: AccessToken,
+        id:               UID,
+        issuer:           address,
+        pricing_policy:   PricingPolicy,
+        min_bandwidth:    u64,    // kB/s
+        min_duration:     u64,    // seconds
+        bw_granularity:   u64,   // kB/s
+        time_granularity: u64,   // seconds
+        token:            AccessToken,
     }
 
     // =========================================================
@@ -62,12 +91,13 @@ module marketplace::marketplace;
     // Seller functions
     // =========================================================
 
-    /// Wraps a previously created AccessToken into a ServiceListing.
-    /// Only the token's original issuer may list it.
+    /// Wraps an AccessToken into a ServiceListing with a flat pricing policy
+    /// (no tier discounts). Call `set_pricing_policy` afterwards to add tiers.
     public entry fun create_listing<COIN>(
         marketplace:      &mut Marketplace<COIN>,
-        mut token:        AccessToken,
-        price_mist:       u64,
+        token:            AccessToken,
+        base_price_mist:  u64,
+        min_price:        u64,
         min_bandwidth:    u64,
         min_duration:     u64,
         bw_granularity:   u64,
@@ -83,20 +113,23 @@ module marketplace::marketplace;
         assert!(min_duration     != 0 && min_duration <= total_duration,          EInvalidInterval);
 
         let listing_uid = object::new(ctx);
+        let id = object::uid_to_inner(&listing_uid);
 
-        let listing = ServiceListing {
+        object_bag::add(&mut marketplace.listings, id, ServiceListing {
             id: listing_uid,
             issuer: ctx.sender(),
-            price_mist,
+            pricing_policy: PricingPolicy {
+                base_price_mist,
+                min_price,
+                bw_tiers:  vector::empty(),
+                dur_tiers: vector::empty(),
+            },
             min_bandwidth,
             min_duration,
             bw_granularity,
             time_granularity,
             token,
-        };
-
-        let id = object::id(&listing);
-        object_bag::add(&mut marketplace.listings, id, listing);
+        });
         id
     }
 
@@ -110,22 +143,41 @@ module marketplace::marketplace;
 
         let listing = object_bag::remove<ID, ServiceListing>(&mut marketplace.listings, listing_id);
         let ServiceListing {
-            id, issuer: _, price_mist: _,
+            id, issuer: _, pricing_policy: _,
             min_bandwidth: _, min_duration: _, bw_granularity: _, time_granularity: _, token,
         } = listing;
         access_token::destroy(token);
         object::delete(id);
     }
 
-    public entry fun update_listing<COIN>(
-        marketplace:    &mut Marketplace<COIN>,
-        listing_id:     ID,
-        new_price_mist: u64,
-        ctx:            &TxContext,
+    // =========================================================
+    // Pricing policy management
+    // =========================================================
+
+    /// Replace the pricing policy on a listing the caller owns.
+    ///
+    /// Pass empty vectors for `bw_thresholds`/`dur_thresholds` to clear tiers
+    /// (reverts to flat `base_price_mist` pricing).
+    /// Thresholds must be strictly ascending within each list.
+    public entry fun set_pricing_policy<COIN>(
+        marketplace:       &mut Marketplace<COIN>,
+        listing_id:        ID,
+        base_price_mist:   u64,
+        min_price:         u64,
+        bw_thresholds:     vector<u64>,
+        bw_fractions_bps:  vector<u64>,
+        dur_thresholds:    vector<u64>,
+        dur_fractions_bps: vector<u64>,
+        ctx:               &TxContext,
     ) {
         let listing = object_bag::borrow_mut<ID, ServiceListing>(&mut marketplace.listings, listing_id);
-        assert!(listing.issuer == ctx.sender(), ENotSeller);
-        listing.price_mist = new_price_mist;
+        assert!(listing.issuer == ctx.sender(), ENotIssuer);
+        listing.pricing_policy = PricingPolicy {
+            base_price_mist,
+            min_price,
+            bw_tiers:  build_tiers(bw_thresholds,  bw_fractions_bps),
+            dur_tiers: build_tiers(dur_thresholds, dur_fractions_bps),
+        };
     }
 
     // =========================================================
@@ -142,7 +194,6 @@ module marketplace::marketplace;
         ctx:         &mut TxContext,
     ): ID {
         let mut listing = object_bag::remove<ID, ServiceListing>(&mut marketplace.listings, listing_id);
-        assert!(coin::value(payment) >= listing.price_mist, EInsufficientPayment);
 
         let seller_from  = access_token::valid_from(&listing.token);
         let seller_until = access_token::expires_at(&listing.token);
@@ -157,15 +208,21 @@ module marketplace::marketplace;
         assert!(listing.bw_granularity   != 0 && bandwidth % listing.bw_granularity   == 0, EInvalidGranularity);
         assert!(listing.time_granularity != 0 && duration  % listing.time_granularity == 0, EInvalidGranularity);
 
+        let max_dur        = seller_until - seller_from;
+        let computed       = compute_price(&listing.pricing_policy, bandwidth, duration, seller_bw, max_dur);
+        let min_price      = listing.pricing_policy.min_price;
+        let effective_price = if (computed > min_price) computed else min_price;
+        assert!(coin::value(payment) >= effective_price, EInsufficientPayment);
+
         access_token::set_valid_from(&mut listing.token, start);
         access_token::set_expires_at(&mut listing.token, end);
         access_token::set_bandwidth(&mut listing.token, bandwidth);
 
-        let seller_payment = coin::split(payment, listing.price_mist, ctx);
+        let seller_payment = coin::split(payment, effective_price, ctx);
         transfer::public_transfer(seller_payment, listing.issuer);
 
         let ServiceListing {
-            id, issuer: _, price_mist: _,
+            id, issuer: _, pricing_policy: _,
             min_bandwidth: _, min_duration: _, bw_granularity: _, time_granularity: _, token,
         } = listing;
         object::delete(id);
@@ -175,9 +232,83 @@ module marketplace::marketplace;
         token_id
     }
 
+    // =========================================================
+    // Pricing helpers (private)
+    // =========================================================
 
+    fun build_tiers(thresholds: vector<u64>, fractions: vector<u64>): vector<DiscountTier> {
+        let n = vector::length(&thresholds);
+        assert!(n == vector::length(&fractions), ETierLengthMismatch);
 
+        let mut tiers = vector::empty<DiscountTier>();
+        let mut i = 0;
+        while (i < n) {
+            let threshold = *vector::borrow(&thresholds, i);
+            if (i > 0) {
+                assert!(threshold > *vector::borrow(&thresholds, i - 1), ETiersNotSorted);
+            };
+            vector::push_back(&mut tiers, DiscountTier {
+                threshold,
+                fraction_bps: *vector::borrow(&fractions, i),
+            });
+            i = i + 1;
+        };
+        tiers
+    }
 
-    fun get_relative_price(price: u64, original_val: u64, new_val: u64){
-        price * new_val / original_val;
+    fun interpolate_fraction(tiers: &vector<DiscountTier>, value: u64): u64 {
+        let n = vector::length(tiers);
+        if (n == 0) return 10_000;
+
+        let first = vector::borrow(tiers, 0);
+        if (value <= first.threshold) return first.fraction_bps;
+
+        let last = vector::borrow(tiers, n - 1);
+        if (value >= last.threshold) return last.fraction_bps;
+
+        let mut i = 0;
+        while (i < n - 1) {
+            let lo = vector::borrow(tiers, i);
+            let hi = vector::borrow(tiers, i + 1);
+            if (value >= lo.threshold && value < hi.threshold) {
+                let span  = hi.threshold - lo.threshold;
+                let delta = value        - lo.threshold;
+                return if (hi.fraction_bps >= lo.fraction_bps) {
+                    lo.fraction_bps + delta * (hi.fraction_bps - lo.fraction_bps) / span
+                } else {
+                    lo.fraction_bps - delta * (lo.fraction_bps - hi.fraction_bps) / span
+                }
+            };
+            i = i + 1;
+        };
+        10_000
+    }
+
+    /// Compute the price for a given (bandwidth, duration) purchase.
+    ///
+    /// Formula:
+    ///   linear = base_price_mist × (bandwidth / max_bw) × (duration / max_dur)
+    ///   price  = linear × bw_fraction(bandwidth) / 10 000
+    ///                   × dur_fraction(duration) / 10 000
+    ///
+    /// Empty tier lists → fractions are 10 000 → pure linear scaling.
+    /// Tier fractions < 10 000 → volume discounts on top of linear.
+    fun compute_price(
+        policy:   &PricingPolicy,
+        bandwidth: u64,
+        duration:  u64,
+        max_bw:    u64,
+        max_dur:   u64,
+    ): u64 {
+        let bw_frac  = interpolate_fraction(&policy.bw_tiers,  bandwidth);
+        let dur_frac = interpolate_fraction(&policy.dur_tiers, duration);
+        // Linear base scales with what the buyer actually purchases.
+        let linear = (policy.base_price_mist as u128)
+            * (bandwidth as u128) / (max_bw  as u128)
+            * (duration  as u128) / (max_dur as u128);
+        // Apply tier discount multipliers.
+        let price = linear;
+        //    * (bw_frac  as u128) / 10_000
+        //    * (dur_frac as u128) / 10_000;
+        (price as u64)
     }

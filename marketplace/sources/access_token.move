@@ -27,6 +27,7 @@ module marketplace::access_token;
         id:           UID,
         service_name: String,
         ip_address:   String,
+        login_server: String,
         valid_from:   u64,     // Unix seconds
         expires_at:   u64,     // Unix seconds
         bandwidth:    u64,     // kB/s
@@ -70,6 +71,7 @@ module marketplace::access_token;
         token_id:     ID,
         service_name: String,
         ip_address:   String,
+        login_server: String,
         valid_from:   u64,
         expires_at:   u64,
         bandwidth:    u64,
@@ -89,12 +91,13 @@ module marketplace::access_token;
     public entry fun create_access_token(
         name:          vector<u8>,
         ip_address:    vector<u8>,
+        login_server:  vector<u8>,
         valid_from:    u64,
         expires_at:    u64,
         max_bandwidth: u64,
         ctx:           &mut TxContext,
     ): ID {
-        let token = create_access_token_obj(name, ip_address, valid_from, expires_at, max_bandwidth, ctx);
+        let token = create_access_token_obj(name, ip_address, login_server, valid_from, expires_at, max_bandwidth, ctx);
         let token_id = object::id(&token);
         transfer::public_transfer(token, ctx.sender());
         token_id
@@ -106,6 +109,7 @@ module marketplace::access_token;
     public fun create_access_token_obj(
         name:          vector<u8>,
         ip_address:    vector<u8>,
+        login_server:  vector<u8>,
         valid_from:    u64,
         expires_at:    u64,
         max_bandwidth: u64,
@@ -118,6 +122,7 @@ module marketplace::access_token;
             id:           object::new(ctx),
             service_name: string::utf8(name),
             ip_address:   string::utf8(ip_address),
+            login_server: string::utf8(login_server),
             valid_from,
             expires_at,
             bandwidth:    max_bandwidth,
@@ -150,14 +155,14 @@ module marketplace::access_token;
     /// `(token_id, issuer, ip_address, valid_from, expires_at, bandwidth)`.
     public(package) fun burn(token: AccessToken): (ID, address, String, u64, u64, u64) {
         let token_id = object::id(&token);
-        let AccessToken { id, service_name: _, ip_address, valid_from, expires_at, bandwidth, issuer } = token;
+        let AccessToken { id, service_name: _, ip_address, login_server: _, valid_from, expires_at, bandwidth, issuer } = token;
         object::delete(id);
         (token_id, issuer, ip_address, valid_from, expires_at, bandwidth)
     }
 
     /// Destroys the token without returning anything (used by `delist`).
     public(package) fun destroy(token: AccessToken) {
-        let AccessToken { id, service_name: _, ip_address: _, valid_from: _, expires_at: _, bandwidth: _, issuer: _ } = token;
+        let AccessToken { id, service_name: _, ip_address: _, login_server: _, valid_from: _, expires_at: _, bandwidth: _, issuer: _ } = token;
         object::delete(id);
     }
 
@@ -168,13 +173,14 @@ module marketplace::access_token;
     fun new_token(
         service_name: String,
         ip_address:   String,
+        login_server: String,
         valid_from:   u64,
         expires_at:   u64,
         bandwidth:    u64,
         issuer:       address,
         ctx:          &mut TxContext,
     ): AccessToken {
-        AccessToken { id: object::new(ctx), service_name, ip_address, valid_from, expires_at, bandwidth, issuer }
+        AccessToken { id: object::new(ctx), service_name, ip_address, login_server, valid_from, expires_at, bandwidth, issuer }
     }
 
     /// Split a token along the bandwidth axis.
@@ -186,7 +192,7 @@ module marketplace::access_token;
         ctx:       &mut TxContext,
     ) {
         assert!(bw_a > 0 && bw_a < token.bandwidth, EInvalidSplit);
-        let remainder = new_token(token.service_name, token.ip_address, token.valid_from, token.expires_at, token.bandwidth - bw_a, token.issuer, ctx);
+        let remainder = new_token(token.service_name, token.ip_address, token.login_server, token.valid_from, token.expires_at, token.bandwidth - bw_a, token.issuer, ctx);
         token.bandwidth = bw_a;
         transfer::public_transfer(token, ctx.sender());
         transfer::public_transfer(remainder, ctx.sender());
@@ -201,7 +207,7 @@ module marketplace::access_token;
         ctx:       &mut TxContext,
     ) {
         assert!(split_at > token.valid_from && split_at < token.expires_at, EInvalidSplit);
-        let remainder = new_token(token.service_name, token.ip_address, split_at, token.expires_at, token.bandwidth, token.issuer, ctx);
+        let remainder = new_token(token.service_name, token.ip_address, token.login_server, split_at, token.expires_at, token.bandwidth, token.issuer, ctx);
         token.expires_at = split_at;
         transfer::public_transfer(token, ctx.sender());
         transfer::public_transfer(remainder, ctx.sender());
@@ -216,20 +222,22 @@ module marketplace::access_token;
         token_b: AccessToken,
         ctx:     &mut TxContext,
     ) {
-        assert!(token_a.issuer     == token_b.issuer,     EIncompatibleTokens);
-        assert!(token_a.ip_address == token_b.ip_address, EIncompatibleTokens);
+        assert!(token_a.issuer       == token_b.issuer,       EIncompatibleTokens);
+        assert!(token_a.ip_address   == token_b.ip_address,   EIncompatibleTokens);
+        assert!(token_a.login_server == token_b.login_server, EIncompatibleTokens);
         let from  = if (token_a.valid_from > token_b.valid_from) { token_a.valid_from } else { token_b.valid_from };
         let until = if (token_a.expires_at < token_b.expires_at) { token_a.expires_at } else { token_b.expires_at };
         assert!(from < until, ENoOverlap);
         let bandwidth    = token_a.bandwidth + token_b.bandwidth;
         let service_name = token_a.service_name;
         let ip_address   = token_a.ip_address;
+        let login_server = token_a.login_server;
         let issuer       = token_a.issuer;
-        let AccessToken { id: id_a, service_name: _, ip_address: _, valid_from: _, expires_at: _, bandwidth: _, issuer: _ } = token_a;
+        let AccessToken { id: id_a, service_name: _, ip_address: _, login_server: _, valid_from: _, expires_at: _, bandwidth: _, issuer: _ } = token_a;
         object::delete(id_a);
-        let AccessToken { id: id_b, service_name: _, ip_address: _, valid_from: _, expires_at: _, bandwidth: _, issuer: _ } = token_b;
+        let AccessToken { id: id_b, service_name: _, ip_address: _, login_server: _, valid_from: _, expires_at: _, bandwidth: _, issuer: _ } = token_b;
         object::delete(id_b);
-        transfer::public_transfer(new_token(service_name, ip_address, from, until, bandwidth, issuer, ctx), ctx.sender());
+        transfer::public_transfer(new_token(service_name, ip_address, login_server, from, until, bandwidth, issuer, ctx), ctx.sender());
     }
 
     /// Fuse two tokens along the time axis.
@@ -241,8 +249,9 @@ module marketplace::access_token;
         token_b: AccessToken,
         ctx:     &mut TxContext,
     ) {
-        assert!(token_a.issuer     == token_b.issuer,     EIncompatibleTokens);
-        assert!(token_a.ip_address == token_b.ip_address, EIncompatibleTokens);
+        assert!(token_a.issuer       == token_b.issuer,       EIncompatibleTokens);
+        assert!(token_a.ip_address   == token_b.ip_address,   EIncompatibleTokens);
+        assert!(token_a.login_server == token_b.login_server, EIncompatibleTokens);
         let max_from  = if (token_a.valid_from > token_b.valid_from) { token_a.valid_from } else { token_b.valid_from };
         let min_until = if (token_a.expires_at < token_b.expires_at) { token_a.expires_at } else { token_b.expires_at };
         assert!(max_from <= min_until, ENoOverlap);
@@ -251,12 +260,13 @@ module marketplace::access_token;
         let bandwidth = if (token_a.bandwidth  < token_b.bandwidth)  { token_a.bandwidth  } else { token_b.bandwidth  };
         let service_name = token_a.service_name;
         let ip_address   = token_a.ip_address;
+        let login_server = token_a.login_server;
         let issuer       = token_a.issuer;
-        let AccessToken { id: id_a, service_name: _, ip_address: _, valid_from: _, expires_at: _, bandwidth: _, issuer: _ } = token_a;
+        let AccessToken { id: id_a, service_name: _, ip_address: _, login_server: _, valid_from: _, expires_at: _, bandwidth: _, issuer: _ } = token_a;
         object::delete(id_a);
-        let AccessToken { id: id_b, service_name: _, ip_address: _, valid_from: _, expires_at: _, bandwidth: _, issuer: _ } = token_b;
+        let AccessToken { id: id_b, service_name: _, ip_address: _, login_server: _, valid_from: _, expires_at: _, bandwidth: _, issuer: _ } = token_b;
         object::delete(id_b);
-        transfer::public_transfer(new_token(service_name, ip_address, from, until, bandwidth, issuer, ctx), ctx.sender());
+        transfer::public_transfer(new_token(service_name, ip_address, login_server, from, until, bandwidth, issuer, ctx), ctx.sender());
     }
 
 
@@ -313,8 +323,8 @@ module marketplace::access_token;
         object::delete(id);
 
         // Unpack and delete the wrapped AccessToken now that delivery is complete.
-        let AccessToken { id: token_uid, service_name, ip_address, valid_from,
-                          expires_at, bandwidth, issuer } = token;
+        let AccessToken { id: token_uid, service_name, ip_address, login_server,
+                          valid_from, expires_at, bandwidth, issuer } = token;
         object::delete(token_uid);
 
         // Keep the event unchanged so existing listeners are unaffected.
@@ -327,6 +337,7 @@ module marketplace::access_token;
                 token_id,
                 service_name,
                 ip_address,
+                login_server,
                 valid_from,
                 expires_at,
                 bandwidth,
