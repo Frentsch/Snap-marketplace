@@ -11,7 +11,8 @@ module marketplace::marketplace;
     use sui::coin::{Self, Coin};
     use sui::event;
     use sui::object_bag::{Self, ObjectBag};
-    use marketplace::access_token::{Self, AccessToken};
+    use marketplace::access_token::{Self, AccessToken, RedemptionRequest};
+    use marketplace::escrow::{Self, Escrow};
 
     // =========================================================
     // Error codes
@@ -26,6 +27,8 @@ module marketplace::marketplace;
     const ENotIssuer:            u64 = 8;
     const ETiersNotSorted:       u64 = 9;
     const ETierLengthMismatch:   u64 = 10;
+    const EEscrowTokenMismatch:  u64 = 11;
+    const EInvalidEscrowStatus:  u64 = 12;
 
     // =========================================================
     // Pricing structs
@@ -74,6 +77,15 @@ module marketplace::marketplace;
         bw_granularity:   u64,   // kB/s
         time_granularity: u64,   // seconds
         token:            AccessToken,
+    }
+
+    /// Emitted by purchase() so the orchestrator can map token_id → escrow_id.
+    public struct PurchaseCompleted has copy, drop {
+        token_id:  ID,
+        escrow_id: ID,
+        buyer:     address,
+        seller:    address,
+        amount:    u64,
     }
 
     // =========================================================
@@ -218,8 +230,8 @@ module marketplace::marketplace;
         access_token::set_expires_at(&mut listing.token, end);
         access_token::set_bandwidth(&mut listing.token, bandwidth);
 
+        let seller         = listing.issuer;
         let seller_payment = coin::split(payment, effective_price, ctx);
-        transfer::public_transfer(seller_payment, listing.issuer);
 
         let ServiceListing {
             id, issuer: _, pricing_policy: _,
@@ -228,8 +240,81 @@ module marketplace::marketplace;
         object::delete(id);
 
         let token_id = object::id(&token);
+
+        // Hold payment in escrow until the buyer redeems and the seller delivers.
+        let escrow_obj = escrow::new_escrow<COIN>(
+            token_id, ctx.sender(), seller, seller_payment, end, ctx,
+        );
+        let escrow_id = object::id(&escrow_obj);
+        escrow::share_escrow(escrow_obj);
+
+        event::emit(PurchaseCompleted { token_id, escrow_id, buyer: ctx.sender(), seller, amount: effective_price });
+
         transfer::public_transfer(token, ctx.sender());
         token_id
+    }
+
+    // =========================================================
+    // Redemption lifecycle (moved from access_token.move)
+    // =========================================================
+
+    /// Buyer redeems their token, registering their public key for encryption
+    /// and advancing the escrow to REDEEMED status.
+    public entry fun redeem<COIN>(
+        escrow:        &mut Escrow<COIN>,
+        token:         AccessToken,
+        client_pubkey: vector<u8>,
+        ctx:           &mut TxContext,
+    ) {
+        assert!(object::id(&token) == escrow::token_id(escrow), EEscrowTokenMismatch);
+        assert!(escrow::status(escrow) == escrow::status_purchased(), EInvalidEscrowStatus);
+
+        // Read event fields before token is moved into the request
+        let issuer     = access_token::issuer(&token);
+        let service_ip = access_token::ip_address(&token);
+        let valid_from = access_token::valid_from(&token);
+        let expires_at = access_token::expires_at(&token);
+        let bandwidth  = access_token::bandwidth(&token);
+        let escrow_id  = object::id(escrow);
+
+        escrow::set_redeemed(escrow);
+
+        let (token_id, request_id, request) = access_token::create_redemption_request(
+            token, ctx.sender(), client_pubkey, ctx,
+        );
+
+        access_token::emit_token_redeemed(
+            token_id, request_id, escrow_id, issuer, ctx.sender(),
+            service_ip, client_pubkey, valid_from, expires_at, bandwidth,
+        );
+
+        access_token::transfer_redemption_request(request, issuer);
+    }
+
+    /// Seller delivers the encrypted auth key, advancing the escrow to DELIVERED
+    /// status so they can immediately claim payment.
+    public entry fun deliver_redemption<COIN>(
+        escrow:             &mut Escrow<COIN>,
+        request:            RedemptionRequest,
+        encrypted_auth_key: vector<u8>,
+        ctx:                &mut TxContext,
+    ) {
+        assert!(access_token::request_token_id(&request) == escrow::token_id(escrow), EEscrowTokenMismatch);
+        assert!(escrow::status(escrow) == escrow::status_redeemed(), EInvalidEscrowStatus);
+
+        escrow::set_delivered(escrow);
+
+        let (token_id, redeemed_by, _, token) = access_token::unpack_redemption_request(request);
+        let (_, service_name, ip_address, login_server, valid_from, expires_at, bandwidth, issuer) =
+            access_token::unpack_token_for_delivery(token);
+
+        access_token::emit_redemption_delivery(token_id, redeemed_by, encrypted_auth_key);
+
+        let access_key = access_token::new_access_key(
+            token_id, service_name, ip_address, login_server,
+            valid_from, expires_at, bandwidth, issuer, encrypted_auth_key, ctx,
+        );
+        transfer::public_transfer(access_key, redeemed_by);
     }
 
     // =========================================================

@@ -48,6 +48,7 @@ module marketplace::access_token;
     public struct TokenRedeemed has copy, drop {
         token_id:      ID,
         request_id:    ID,           // ID of the RedemptionRequest object
+        escrow_id:     ID,           // ID of the shared Escrow object
         issuer:        address,
         redeemed_by:   address,
         service_ip:    String,
@@ -134,10 +135,13 @@ module marketplace::access_token;
     // Package-internal getters
     // =========================================================
 
-    public(package) fun valid_from(t: &AccessToken): u64     { t.valid_from }
-    public(package) fun expires_at(t: &AccessToken): u64     { t.expires_at }
-    public(package) fun bandwidth(t: &AccessToken): u64      { t.bandwidth }
-    public(package) fun issuer(t: &AccessToken): address     { t.issuer }
+    public(package) fun valid_from(t: &AccessToken): u64      { t.valid_from  }
+    public(package) fun expires_at(t: &AccessToken): u64      { t.expires_at  }
+    public(package) fun bandwidth(t: &AccessToken): u64       { t.bandwidth   }
+    public(package) fun issuer(t: &AccessToken): address      { t.issuer      }
+    public(package) fun ip_address(t: &AccessToken): String   { t.ip_address  }
+
+    public(package) fun request_token_id(req: &RedemptionRequest): ID { req.token_id }
 
     // =========================================================
     // Package-internal setters
@@ -271,79 +275,91 @@ module marketplace::access_token;
 
 
     // =========================================================
-    // Redemption
+    // Redemption — package-internal helpers
+    // (redeem() and deliver_redemption() entry fns live in marketplace.move
+    //  so they can also update the Escrow object atomically.)
     // =========================================================
 
-    public entry fun redeem(
+    /// Creates a RedemptionRequest wrapping the token; returns (token_id, request_id, request).
+    public(package) fun create_redemption_request(
         token:         AccessToken,
+        redeemed_by:   address,
         client_pubkey: vector<u8>,
         ctx:           &mut TxContext,
-    ) {
-        // Read fields by copy before moving token into the request.
-        // All types (String, u64, address) have the `copy` ability.
-        let token_id   = object::id(&token);
-        let issuer     = token.issuer;
-        let service_ip = token.ip_address;
-        let valid_from = token.valid_from;
-        let expires_at = token.expires_at;
-        let bandwidth  = token.bandwidth;
-
+    ): (ID, ID, RedemptionRequest) {
+        let token_id    = object::id(&token);
         let request_uid = object::new(ctx);
         let request_id  = object::uid_to_inner(&request_uid);
-
-        event::emit(TokenRedeemed {
-            token_id,
-            request_id,
-            issuer,
-            redeemed_by:  ctx.sender(),
-            service_ip,
-            client_pubkey,
-            valid_from,
-            expires_at,
-            bandwidth,
-        });
-
-        // Wrap the token instead of burning it so the issuer retains full
-        // service metadata while processing the redemption.
-        transfer::transfer(RedemptionRequest {
-            id:           request_uid,
-            token_id,
-            redeemed_by:  ctx.sender(),
-            client_pubkey,
-            token,
-        }, issuer);
+        (token_id, request_id, RedemptionRequest { id: request_uid, token_id, redeemed_by, client_pubkey, token })
     }
 
-    public entry fun deliver_redemption(
-        request:            RedemptionRequest,
-        encrypted_auth_key: vector<u8>,
-        ctx:                &mut TxContext,
-    ) {
-        let RedemptionRequest { id, token_id, redeemed_by, client_pubkey: _, token } = request;
+    /// Destructures a RedemptionRequest; deletes its UID; returns (token_id, redeemed_by, client_pubkey, token).
+    public(package) fun unpack_redemption_request(
+        request: RedemptionRequest,
+    ): (ID, address, vector<u8>, AccessToken) {
+        let RedemptionRequest { id, token_id, redeemed_by, client_pubkey, token } = request;
         object::delete(id);
+        (token_id, redeemed_by, client_pubkey, token)
+    }
 
-        // Unpack and delete the wrapped AccessToken now that delivery is complete.
-        let AccessToken { id: token_uid, service_name, ip_address, login_server,
-                          valid_from, expires_at, bandwidth, issuer } = token;
-        object::delete(token_uid);
+    /// Destructures an AccessToken for use in deliver_redemption; deletes its UID.
+    /// Returns (token_id, service_name, ip_address, login_server, valid_from, expires_at, bandwidth, issuer).
+    public(package) fun unpack_token_for_delivery(
+        token: AccessToken,
+    ): (ID, String, String, String, u64, u64, u64, address) {
+        let token_id = object::id(&token);
+        let AccessToken { id, service_name, ip_address, login_server, valid_from, expires_at, bandwidth, issuer } = token;
+        object::delete(id);
+        (token_id, service_name, ip_address, login_server, valid_from, expires_at, bandwidth, issuer)
+    }
 
-        // Keep the event unchanged so existing listeners are unaffected.
+    /// Constructs an AccessKey (used by marketplace::deliver_redemption).
+    public(package) fun new_access_key(
+        token_id:     ID,
+        service_name: String,
+        ip_address:   String,
+        login_server: String,
+        valid_from:   u64,
+        expires_at:   u64,
+        bandwidth:    u64,
+        issuer:       address,
+        auth_key:     vector<u8>,
+        ctx:          &mut TxContext,
+    ): AccessKey {
+        AccessKey { id: object::new(ctx), token_id, service_name, ip_address, login_server, valid_from, expires_at, bandwidth, issuer, auth_key }
+    }
+
+    /// Emits the TokenRedeemed event (called from marketplace::redeem).
+    public(package) fun emit_token_redeemed(
+        token_id:      ID,
+        request_id:    ID,
+        escrow_id:     ID,
+        issuer:        address,
+        redeemed_by:   address,
+        service_ip:    String,
+        client_pubkey: vector<u8>,
+        valid_from:    u64,
+        expires_at:    u64,
+        bandwidth:     u64,
+    ) {
+        event::emit(TokenRedeemed {
+            token_id, request_id, escrow_id, issuer, redeemed_by,
+            service_ip, client_pubkey, valid_from, expires_at, bandwidth,
+        });
+    }
+
+    /// Transfers a RedemptionRequest to the given recipient.
+    /// Must live here because RedemptionRequest has only `key` (no `store`),
+    /// restricting transfer::transfer to the defining module.
+    public(package) fun transfer_redemption_request(req: RedemptionRequest, recipient: address) {
+        transfer::transfer(req, recipient);
+    }
+
+    /// Emits the RedemptionDelivery event (called from marketplace::deliver_redemption).
+    public(package) fun emit_redemption_delivery(
+        token_id:           ID,
+        redeemed_by:        address,
+        encrypted_auth_key: vector<u8>,
+    ) {
         event::emit(RedemptionDelivery { token_id, redeemed_by, encrypted_auth_key });
-
-        // Transfer a persistent AccessKey with full service metadata to the buyer.
-        transfer::transfer(
-            AccessKey {
-                id: object::new(ctx),
-                token_id,
-                service_name,
-                ip_address,
-                login_server,
-                valid_from,
-                expires_at,
-                bandwidth,
-                issuer,
-                auth_key: encrypted_auth_key,
-            },
-            redeemed_by,
-        );
     }
