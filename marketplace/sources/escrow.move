@@ -14,6 +14,10 @@ module marketplace::escrow {
     const ENotBuyer:           u64 = 21;
     const EEscrowNotClaimable: u64 = 22;
 
+    // other constants
+
+    const GRACE_PERIOD:  u64 = 30;
+
     // ── Struct ────────────────────────────────────────────────────────────────
 
     /// Shared object that holds payment until the redemption outcome is settled.
@@ -25,6 +29,8 @@ module marketplace::escrow {
         payment:    Coin<COIN>,
         status:     u8,
         expires_at: u64,   // Unix seconds; copied from the purchased token window
+        redeemed_at: u64,
+        delivered_at: u64
     }
 
     // ── Package-internal API (callable only from marketplace.move) ────────────
@@ -45,6 +51,8 @@ module marketplace::escrow {
             payment,
             status: STATUS_PURCHASED,
             expires_at,
+            redeemed_at: 0,
+            delivered_at: 0,
         }
     }
 
@@ -55,8 +63,8 @@ module marketplace::escrow {
         transfer::share_object(escrow);
     }
 
-    public(package) fun set_redeemed<COIN>(e: &mut Escrow<COIN>)  { e.status = STATUS_REDEEMED  }
-    public(package) fun set_delivered<COIN>(e: &mut Escrow<COIN>) { e.status = STATUS_DELIVERED }
+    public(package) fun set_redeemed<COIN>(e: &mut Escrow<COIN>, clock: &Clock)  { e.status = STATUS_REDEEMED; e.redeemed_at = clock::timestamp_ms(clock) /1000 }
+    public(package) fun set_delivered<COIN>(e: &mut Escrow<COIN>, clock: &Clock) { e.status = STATUS_DELIVERED; e.delivered_at = clock::timestamp_ms(clock) / 1000 }
 
     public(package) fun token_id<COIN>(e: &Escrow<COIN>): ID { e.token_id }
     public(package) fun status<COIN>(e: &Escrow<COIN>): u8   { e.status   }
@@ -68,6 +76,7 @@ module marketplace::escrow {
 
     /// Seller claims payment immediately after delivery, or after expiry if the
     /// buyer never attempted to redeem (status still PURCHASED).
+    /// Sellers must deliver the redemption within 30 seconds
     public entry fun claim_payment<COIN>(
         escrow: Escrow<COIN>,
         clock:  &Clock,
@@ -76,17 +85,19 @@ module marketplace::escrow {
         assert!(ctx.sender() == escrow.seller, ENotSeller);
         let now = clock::timestamp_ms(clock) / 1000;
         assert!(
-            escrow.status == STATUS_DELIVERED ||
+            (escrow.status == STATUS_DELIVERED && escrow.delivered_at < escrow.redeemed_at + GRACE_PERIOD) ||
             (escrow.status == STATUS_PURCHASED && now > escrow.expires_at),
             EEscrowNotClaimable,
         );
-        let Escrow { id, token_id: _, buyer: _, seller, payment, status: _, expires_at: _ } = escrow;
+        let Escrow { id, token_id: _, buyer: _, seller, payment, status: _, expires_at: _, redeemed_at: _, delivered_at: _ } = escrow;
         object::delete(id);
         transfer::public_transfer(payment, seller);
     }
 
     /// Buyer claims a refund after expiry when the seller failed to call
     /// deliver_redemption despite the token having been redeemed.
+    /// The seller has 30 seconds time to deliver the redemption to avoid 
+    /// buyers redeeming just before expiry to claim refunds.
     public entry fun claim_refund<COIN>(
         escrow: Escrow<COIN>,
         clock:  &Clock,
@@ -95,10 +106,11 @@ module marketplace::escrow {
         assert!(ctx.sender() == escrow.buyer, ENotBuyer);
         let now = clock::timestamp_ms(clock) / 1000;
         assert!(
-            escrow.status == STATUS_REDEEMED && now > escrow.expires_at,
+            escrow.status == STATUS_REDEEMED && now > escrow.expires_at && escrow.redeemed_at > now + GRACE_PERIOD ||
+            escrow.status == STATUS_DELIVERED && escrow.delivered_at >= escrow.redeemed_at + GRACE_PERIOD,
             EEscrowNotClaimable,
         );
-        let Escrow { id, token_id: _, buyer, seller: _, payment, status: _, expires_at: _ } = escrow;
+        let Escrow { id, token_id: _, buyer, seller: _, payment, status: _, expires_at: _, redeemed_at: _, delivered_at: _ } = escrow;
         object::delete(id);
         transfer::public_transfer(payment, buyer);
     }

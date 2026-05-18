@@ -13,6 +13,7 @@ module marketplace::marketplace;
     use sui::object_bag::{Self, ObjectBag};
     use marketplace::access_token::{Self, AccessToken, RedemptionRequest};
     use marketplace::escrow::{Self, Escrow};
+    use sui::clock::{Self,Clock};
 
     // =========================================================
     // Error codes
@@ -262,6 +263,7 @@ module marketplace::marketplace;
     /// and advancing the escrow to REDEEMED status.
     public entry fun redeem<COIN>(
         escrow:        &mut Escrow<COIN>,
+        clock:         &Clock,
         token:         AccessToken,
         client_pubkey: vector<u8>,
         ctx:           &mut TxContext,
@@ -277,7 +279,7 @@ module marketplace::marketplace;
         let bandwidth  = access_token::bandwidth(&token);
         let escrow_id  = object::id(escrow);
 
-        escrow::set_redeemed(escrow);
+        escrow::set_redeemed(escrow, clock);
 
         let (token_id, request_id, request) = access_token::create_redemption_request(
             token, ctx.sender(), client_pubkey, ctx,
@@ -295,6 +297,7 @@ module marketplace::marketplace;
     /// status so they can immediately claim payment.
     public entry fun deliver_redemption<COIN>(
         escrow:             &mut Escrow<COIN>,
+        clock:              &Clock,
         request:            RedemptionRequest,
         encrypted_auth_key: vector<u8>,
         ctx:                &mut TxContext,
@@ -302,7 +305,7 @@ module marketplace::marketplace;
         assert!(access_token::request_token_id(&request) == escrow::token_id(escrow), EEscrowTokenMismatch);
         assert!(escrow::status(escrow) == escrow::status_redeemed(), EInvalidEscrowStatus);
 
-        escrow::set_delivered(escrow);
+        escrow::set_delivered(escrow, clock);
 
         let (token_id, redeemed_by, _, token) = access_token::unpack_redemption_request(request);
         let (_, service_name, ip_address, login_server, valid_from, expires_at, bandwidth, issuer) =
