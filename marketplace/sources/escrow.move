@@ -106,8 +106,8 @@ module marketplace::escrow {
         assert!(ctx.sender() == escrow.buyer, ENotBuyer);
         let now = clock::timestamp_ms(clock) / 1000;
         assert!(
-            escrow.status == STATUS_REDEEMED && now > escrow.expires_at && escrow.redeemed_at > now + GRACE_PERIOD ||
-            escrow.status == STATUS_DELIVERED && escrow.delivered_at >= escrow.redeemed_at + GRACE_PERIOD,
+            (escrow.status == STATUS_REDEEMED && now > escrow.expires_at && now > escrow.redeemed_at + GRACE_PERIOD) ||
+            (escrow.status == STATUS_DELIVERED && escrow.delivered_at >= escrow.redeemed_at + GRACE_PERIOD),
             EEscrowNotClaimable,
         );
         let Escrow { id, token_id: _, buyer, seller: _, payment, status: _, expires_at: _, redeemed_at: _, delivered_at: _ } = escrow;

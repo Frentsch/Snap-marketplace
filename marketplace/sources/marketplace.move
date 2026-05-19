@@ -197,7 +197,7 @@ module marketplace::marketplace;
     // Purchase
     // =========================================================
 
-    public entry fun purchase<COIN>(
+    fun purchase_internal<COIN>(
         marketplace: &mut Marketplace<COIN>,
         listing_id:  ID,
         payment:     &mut Coin<COIN>,
@@ -205,7 +205,7 @@ module marketplace::marketplace;
         end:         u64,
         bandwidth:   u64,
         ctx:         &mut TxContext,
-    ): ID {
+    ): (AccessToken, Escrow<COIN>) {
         let mut listing = object_bag::remove<ID, ServiceListing>(&mut marketplace.listings, listing_id);
 
         let seller_from  = access_token::valid_from(&listing.token);
@@ -242,26 +242,50 @@ module marketplace::marketplace;
 
         let token_id = object::id(&token);
 
-        // Hold payment in escrow until the buyer redeems and the seller delivers.
         let escrow_obj = escrow::new_escrow<COIN>(
             token_id, ctx.sender(), seller, seller_payment, end, ctx,
         );
-        let escrow_id = object::id(&escrow_obj);
+        event::emit(PurchaseCompleted { token_id, escrow_id: object::id(&escrow_obj), buyer: ctx.sender(), seller, amount: effective_price });
+
+        (token, escrow_obj)
+    }
+
+    public entry fun purchase<COIN>(
+        marketplace: &mut Marketplace<COIN>,
+        listing_id:  ID,
+        payment:     &mut Coin<COIN>,
+        start:       u64,
+        end:         u64,
+        bandwidth:   u64,
+        ctx:         &mut TxContext,
+    ): ID {
+        let (token, escrow_obj) = purchase_internal(marketplace, listing_id, payment, start, end, bandwidth, ctx);
+        let token_id = object::id(&token);
         escrow::share_escrow(escrow_obj);
-
-        event::emit(PurchaseCompleted { token_id, escrow_id, buyer: ctx.sender(), seller, amount: effective_price });
-
         transfer::public_transfer(token, ctx.sender());
         token_id
+    }
+
+    /// Non-entry version of purchase for PTB chaining.
+    /// Returns the AccessToken and unshared Escrow so the caller can pipe them
+    /// into a subsequent redeem_and_share call within the same PTB.
+    public fun purchase_token<COIN>(
+        marketplace: &mut Marketplace<COIN>,
+        listing_id:  ID,
+        payment:     &mut Coin<COIN>,
+        start:       u64,
+        end:         u64,
+        bandwidth:   u64,
+        ctx:         &mut TxContext,
+    ): (AccessToken, Escrow<COIN>) {
+        purchase_internal(marketplace, listing_id, payment, start, end, bandwidth, ctx)
     }
 
     // =========================================================
     // Redemption lifecycle (moved from access_token.move)
     // =========================================================
 
-    /// Buyer redeems their token, registering their public key for encryption
-    /// and advancing the escrow to REDEEMED status.
-    public entry fun redeem<COIN>(
+    fun redeem_internal<COIN>(
         escrow:        &mut Escrow<COIN>,
         clock:         &Clock,
         token:         AccessToken,
@@ -291,6 +315,33 @@ module marketplace::marketplace;
         );
 
         access_token::transfer_redemption_request(request, issuer);
+    }
+
+    /// Buyer redeems their token, registering their public key for encryption
+    /// and advancing the escrow to REDEEMED status.
+    public entry fun redeem<COIN>(
+        escrow:        &mut Escrow<COIN>,
+        clock:         &Clock,
+        token:         AccessToken,
+        client_pubkey: vector<u8>,
+        ctx:           &mut TxContext,
+    ) {
+        redeem_internal(escrow, clock, token, client_pubkey, ctx);
+    }
+
+    /// Non-entry version of redeem for PTB chaining.
+    /// Takes the owned Escrow returned by purchase_token, runs redeem logic,
+    /// then shares the escrow so the seller can call deliver_redemption later.
+    public fun redeem_and_share<COIN>(
+        escrow:        Escrow<COIN>,
+        clock:         &Clock,
+        token:         AccessToken,
+        client_pubkey: vector<u8>,
+        ctx:           &mut TxContext,
+    ) {
+        let mut escrow = escrow;
+        redeem_internal(&mut escrow, clock, token, client_pubkey, ctx);
+        escrow::share_escrow(escrow);
     }
 
     /// Seller delivers the encrypted auth key, advancing the escrow to DELIVERED
