@@ -1,8 +1,6 @@
 module marketplace::user_secret {
     use sui::bcs;
     use sui::transfer;
-    use sui::tx_context::{Self, TxContext};
-    use sui::object::{Self, UID};
 
     public struct UserSecret has key {
         id:               UID,

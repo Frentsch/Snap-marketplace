@@ -20,7 +20,7 @@ module marketplace::marketplace;
     // =========================================================
     const EInsufficientPayment:  u64 = 0;
     const ENotSeller:            u64 = 2;
-    const ETokenInvalid:         u64 = 3; // reserved
+    const ETokenInvalid:         u64 = 3;
     const EInvalidInterval:      u64 = 4;
     const EInvalidBandwidth:     u64 = 5;
     const EInvalidMinBandwidth:  u64 = 6;
@@ -45,7 +45,7 @@ module marketplace::marketplace;
     /// Pricing policy embedded in every ServiceListing.
     ///
     /// Price formula:
-    ///   computed  = base_price_mist
+    ///   computed  = base_price_mist × bandwidth × duration
     ///             × bw_fraction(bandwidth)  / 10 000
     ///             × dur_fraction(duration)  / 10 000
     ///   effective = max(min_price, computed)
@@ -53,7 +53,7 @@ module marketplace::marketplace;
     /// Fractions are linearly interpolated from the tier lists.
     /// Empty tier list → fraction is always 10 000 (100%), i.e. no volume discount.
     public struct PricingPolicy has store, drop {
-        base_price_mist: u64,                   // reference price at full usage
+        base_price_mist: u64,                   // price per (kB/s × second) in MIST
         min_price:       u64,                   // absolute price floor in MIST
         bw_tiers:        vector<DiscountTier>,  // sorted ascending by threshold (kB/s)
         dur_tiers:       vector<DiscountTier>,  // sorted ascending by threshold (seconds)
@@ -197,6 +197,114 @@ module marketplace::marketplace;
     // Purchase
     // =========================================================
 
+    // returns true if the listing fulfills the minimum bw/duration requirements  
+    fun isValidListing(
+        listing: &ServiceListing
+    ): bool {
+        let start =  access_token::valid_from(&listing.token);
+        let end =  access_token::expires_at(&listing.token);
+        let bw =  access_token::bandwidth(&listing.token);
+        bw >= listing.min_bandwidth 
+        && bw >= listing.bw_granularity
+        && start < end
+        && (end-start) >= listing.min_duration
+        && (end-start) >= listing.time_granularity
+    }
+
+    fun split_bandwidth(
+        listing: &mut ServiceListing,
+        split_bw: u64,
+        ctx: &mut TxContext
+    ): ServiceListing{
+        let old_bw = access_token::bandwidth(&listing.token);
+        assert!(
+            split_bw >= listing.min_bandwidth
+            && split_bw < old_bw,
+            EInvalidBandwidth
+        );
+        assert!( split_bw % listing.bw_granularity == 0, EInvalidGranularity);
+        let new_asset = access_token::split_bandwidth_internal(&mut listing.token, split_bw, ctx);
+
+        let new_listing = ServiceListing{  
+            id:               object::new(ctx),
+            issuer:           listing.issuer,
+            pricing_policy:   clone_pricing_policy(&listing.pricing_policy),
+            min_bandwidth:    listing.min_bandwidth,    // kB/s
+            min_duration:     listing.min_duration,    // seconds
+            bw_granularity:   listing.bw_granularity,   // kB/s
+            time_granularity: listing.time_granularity,   // seconds
+            token:            new_asset,
+        };
+
+        new_listing
+
+    }
+
+    fun split_time (
+        listing: &mut ServiceListing,
+        split_time: u64,
+        ctx:    &mut TxContext
+    ): ServiceListing {
+
+        assert!(
+            split_time > access_token::valid_from(&listing.token)
+            && split_time < access_token::expires_at(&listing.token),
+            EInvalidInterval
+        );
+
+        let new_asset = access_token::split_time_internal(&mut listing.token, split_time, ctx);
+        
+        let new_listing = ServiceListing{  
+            id:               object::new(ctx),
+            issuer:           listing.issuer,
+            pricing_policy:   clone_pricing_policy(&listing.pricing_policy),
+            min_bandwidth:    listing.min_bandwidth,    // kB/s
+            min_duration:     listing.min_duration,    // seconds
+            bw_granularity:   listing.bw_granularity,   // kB/s
+            time_granularity: listing.time_granularity,   // seconds
+            token:            new_asset,
+        };
+
+        new_listing
+    }
+
+    fun extract_asset_by_time<COIN>(
+        market: &mut Marketplace<COIN>,
+        mut listing: ServiceListing,
+        valid_from: u64,
+        expires_at: u64,
+        ctx:    &mut TxContext
+    ): ServiceListing {
+        let old_start  = access_token::valid_from(&listing.token);
+        let old_end = access_token::expires_at(&listing.token);
+        let duration = expires_at - valid_from;
+
+        assert!(valid_from < expires_at
+                && valid_from >=old_start
+                && expires_at <= old_end
+                && duration >= listing.min_duration, EInvalidInterval);
+
+        assert!(duration % listing.time_granularity == 0, EInvalidGranularity);
+
+        if(valid_from > old_start){
+            let new_listing = split_time(&mut listing, valid_from,ctx);
+            let new_id = object::id(&listing);
+            if(isValidListing(&listing)) {object_bag::add(&mut market.listings, new_id, listing);}
+            else {destroy_listing(listing);};
+            listing = new_listing;
+        };
+
+        if(expires_at < old_end){
+            let new_listing = split_time(&mut listing, expires_at, ctx);
+            let new_id = object::id(&new_listing);
+            if(isValidListing(&new_listing)) {object_bag::add(&mut market.listings, new_id, new_listing);}
+            else {destroy_listing(new_listing);}
+        };
+
+        listing
+    }
+
+
     fun purchase_internal<COIN>(
         marketplace: &mut Marketplace<COIN>,
         listing_id:  ID,
@@ -207,47 +315,49 @@ module marketplace::marketplace;
         ctx:         &mut TxContext,
     ): (AccessToken, Escrow<COIN>) {
         let mut listing = object_bag::remove<ID, ServiceListing>(&mut marketplace.listings, listing_id);
+        // split asset into desired bounds
+        listing = extract_asset_by_time<COIN>(marketplace, listing, start, end, ctx);
 
-        let seller_from  = access_token::valid_from(&listing.token);
-        let seller_until = access_token::expires_at(&listing.token);
-        let seller_bw    = access_token::bandwidth(&listing.token);
-        assert!(start >= seller_from,                                          EInvalidInterval);
-        assert!(end > start && end <= seller_until,                           EInvalidInterval);
-        assert!(seller_bw == 0 || (bandwidth > 0 && bandwidth <= seller_bw), EInvalidBandwidth);
-
-        let duration = end - start;
-        assert!(listing.min_bandwidth != 0 && bandwidth >= listing.min_bandwidth,            EInvalidBandwidth);
-        assert!(listing.min_duration  != 0 && duration  >= listing.min_duration,             EInvalidInterval);
-        assert!(listing.bw_granularity   != 0 && bandwidth % listing.bw_granularity   == 0, EInvalidGranularity);
-        assert!(listing.time_granularity != 0 && duration  % listing.time_granularity == 0, EInvalidGranularity);
-
-        let max_dur        = seller_until - seller_from;
-        let computed       = compute_price(&listing.pricing_policy, bandwidth, duration, seller_bw, max_dur);
-        let min_price      = listing.pricing_policy.min_price;
-        let effective_price = if (computed > min_price) computed else min_price;
+        if(bandwidth != access_token::bandwidth(&listing.token)){
+            let new_listing = split_bandwidth(&mut listing, bandwidth, ctx);
+            let new_id = object::id(&new_listing);
+            if(isValidListing(&new_listing)) {object_bag::add(&mut marketplace.listings, new_id, new_listing);}
+            else {destroy_listing(new_listing);}
+        };
+        
+        
+        // calculate price of asset
+        let effective_price = compute_price(&listing);
         assert!(coin::value(payment) >= effective_price, EInsufficientPayment);
-
-        access_token::set_valid_from(&mut listing.token, start);
-        access_token::set_expires_at(&mut listing.token, end);
-        access_token::set_bandwidth(&mut listing.token, bandwidth);
-
-        let seller         = listing.issuer;
         let seller_payment = coin::split(payment, effective_price, ctx);
 
         let ServiceListing {
-            id, issuer: _, pricing_policy: _,
-            min_bandwidth: _, min_duration: _, bw_granularity: _, time_granularity: _, token,
+            id,
+            issuer,
+            pricing_policy,
+            min_bandwidth,
+            min_duration,
+            bw_granularity,
+            time_granularity,
+            token: access_token,
         } = listing;
-        object::delete(id);
 
-        let token_id = object::id(&token);
-
+        // escrow payment
+        let token_id = object::id(&access_token);
         let escrow_obj = escrow::new_escrow<COIN>(
-            token_id, ctx.sender(), seller, seller_payment, end, ctx,
+            token_id, ctx.sender(), issuer, seller_payment, end, ctx,
         );
-        event::emit(PurchaseCompleted { token_id, escrow_id: object::id(&escrow_obj), buyer: ctx.sender(), seller, amount: effective_price });
 
-        (token, escrow_obj)
+        event::emit(PurchaseCompleted {
+            token_id,
+            escrow_id: object::id(&escrow_obj),
+            buyer:     ctx.sender(),
+            seller:     issuer,
+            amount:    effective_price,
+        });
+        object::delete(id);
+        (access_token, escrow_obj)
+
     }
 
     public entry fun purchase<COIN>(
@@ -282,7 +392,7 @@ module marketplace::marketplace;
     }
 
     // =========================================================
-    // Redemption lifecycle (moved from access_token.move)
+    // Redemption lifecycle 
     // =========================================================
 
     fun redeem_internal<COIN>(
@@ -372,8 +482,29 @@ module marketplace::marketplace;
     }
 
     // =========================================================
-    // Pricing helpers (private)
+    // Private helpers
     // =========================================================
+
+    fun destroy_listing(listing: ServiceListing) {
+        let ServiceListing {
+            id, issuer: _, pricing_policy: _,
+            min_bandwidth: _, min_duration: _, bw_granularity: _, time_granularity: _, token,
+        } = listing;
+        access_token::destroy(token);
+        object::delete(id);
+    }
+
+    fun clone_pricing_policy(p: &PricingPolicy): PricingPolicy {
+        let n_bw  = vector::length(&p.bw_tiers);
+        let n_dur = vector::length(&p.dur_tiers);
+        let mut bw_tiers  = vector::empty<DiscountTier>();
+        let mut dur_tiers = vector::empty<DiscountTier>();
+        let mut i = 0;
+        while (i < n_bw)  { vector::push_back(&mut bw_tiers,  *vector::borrow(&p.bw_tiers,  i)); i = i + 1; };
+        i = 0;
+        while (i < n_dur) { vector::push_back(&mut dur_tiers, *vector::borrow(&p.dur_tiers, i)); i = i + 1; };
+        PricingPolicy { base_price_mist: p.base_price_mist, min_price: p.min_price, bw_tiers, dur_tiers }
+    }
 
     fun build_tiers(thresholds: vector<u64>, fractions: vector<u64>): vector<DiscountTier> {
         let n = vector::length(&thresholds);
@@ -423,31 +554,29 @@ module marketplace::marketplace;
         10_000
     }
 
-    /// Compute the price for a given (bandwidth, duration) purchase.
+
+    /// Compute the effective price for a (bandwidth, duration) purchase.
     ///
     /// Formula:
-    ///   linear = base_price_mist × (bandwidth / max_bw) × (duration / max_dur)
-    ///   price  = linear × bw_fraction(bandwidth) / 10 000
-    ///                   × dur_fraction(duration) / 10 000
+    ///   computed  = base_price_mist × bandwidth × duration
+    ///             × bw_fraction(bandwidth) / 10 000
+    ///             × dur_fraction(duration) / 10 000
+    ///   effective = max(min_price, computed)
     ///
-    /// Empty tier lists → fractions are 10 000 → pure linear scaling.
-    /// Tier fractions < 10 000 → volume discounts on top of linear.
-    fun compute_price(
-        policy:   &PricingPolicy,
-        bandwidth: u64,
-        duration:  u64,
-        max_bw:    u64,
-        max_dur:   u64,
-    ): u64 {
-        let bw_frac  = interpolate_fraction(&policy.bw_tiers,  bandwidth);
-        let dur_frac = interpolate_fraction(&policy.dur_tiers, duration);
-        // Linear base scales with what the buyer actually purchases.
-        let linear = (policy.base_price_mist as u128)
-            * (bandwidth as u128) / (max_bw  as u128)
-            * (duration  as u128) / (max_dur as u128);
-        // Apply tier discount multipliers.
-        let price = linear;
-        //    * (bw_frac  as u128) / 10_000
-        //    * (dur_frac as u128) / 10_000;
-        (price as u64)
+    /// base_price_mist is in MIST per (kB/s × second), so the result scales
+    /// linearly with both dimensions — consistent across remainder listings.
+    /// Empty tier lists → fractions are 10 000 → no discount applied.
+    fun compute_price(listing: &ServiceListing): u64 {
+        let bandwidth = access_token::bandwidth(&listing.token);
+        let duration  = access_token::expires_at(&listing.token) - access_token::valid_from(&listing.token);
+        let policy    = &listing.pricing_policy;
+        let bw_frac   = interpolate_fraction(&policy.bw_tiers,  bandwidth);
+        let dur_frac  = interpolate_fraction(&policy.dur_tiers, duration);
+        let computed  = (policy.base_price_mist as u128)
+            * (bandwidth as u128)
+            * (duration  as u128)
+            * (bw_frac   as u128) / 10_000
+            * (dur_frac  as u128) / 10_000;
+        let computed_u64 = (computed as u64);
+        if (computed_u64 > policy.min_price) { computed_u64 } else { policy.min_price }
     }

@@ -187,34 +187,53 @@ module marketplace::access_token;
         AccessToken { id: object::new(ctx), service_name, ip_address, login_server, valid_from, expires_at, bandwidth, issuer }
     }
 
+    /// Package-internal bandwidth split: returns `(token_a, token_b)` where
+    /// `token_a.bandwidth = bw_a` and `token_b.bandwidth = original - bw_a`.
+    /// Both tokens keep the original time window unchanged.
+    public(package) fun split_bandwidth_internal(
+        token:      &mut AccessToken,
+        bw_a:      u64,
+        ctx:       &mut TxContext,
+    ): AccessToken {
+        assert!(bw_a > 0 && bw_a < token.bandwidth, EInvalidSplit);
+        let remainder = new_token(token.service_name, token.ip_address, token.login_server, token.valid_from, token.expires_at, token.bandwidth - bw_a, token.issuer, ctx);
+        token.bandwidth = bw_a;
+        remainder
+    }
+
+    /// Package-internal time split: returns `(token_a [valid_from..split_at], token_b [split_at..expires_at])`.
+    /// Both tokens keep the original bandwidth unchanged.
+    public(package) fun split_time_internal(
+        token: &mut AccessToken,
+        split_at:  u64,
+        ctx:       &mut TxContext,
+    ): AccessToken {
+        assert!(split_at > token.valid_from && split_at < token.expires_at, EInvalidSplit);
+        let remainder = new_token(token.service_name, token.ip_address, token.login_server, split_at, token.expires_at, token.bandwidth, token.issuer, ctx);
+        token.expires_at = split_at;
+        remainder
+    }
+
     /// Split a token along the bandwidth axis.
     /// The original token's bandwidth is set to `bw_a`; a new token with the
     /// remainder `bandwidth - bw_a` is created. Both share the original time interval.
     public entry fun split_bandwidth(
-        mut token: AccessToken,
-        bw_a:      u64,
-        ctx:       &mut TxContext,
+        token: &mut AccessToken,
+        bw_a:  u64,
+        ctx:   &mut TxContext,
     ) {
-        assert!(bw_a > 0 && bw_a < token.bandwidth, EInvalidSplit);
-        let remainder = new_token(token.service_name, token.ip_address, token.login_server, token.valid_from, token.expires_at, token.bandwidth - bw_a, token.issuer, ctx);
-        token.bandwidth = bw_a;
-        transfer::public_transfer(token, ctx.sender());
-        transfer::public_transfer(remainder, ctx.sender());
+        transfer::public_transfer(split_bandwidth_internal(token, bw_a, ctx), ctx.sender());
     }
 
     /// Split a token along the time axis at `split_at`.
     /// The original token's interval is shortened to `[valid_from, split_at]`; a new
     /// token covering `[split_at, expires_at]` is created. Both keep the original bandwidth.
     public entry fun split_time(
-        mut token: AccessToken,
-        split_at:  u64,
-        ctx:       &mut TxContext,
+        token:    &mut AccessToken,
+        split_at: u64,
+        ctx:      &mut TxContext,
     ) {
-        assert!(split_at > token.valid_from && split_at < token.expires_at, EInvalidSplit);
-        let remainder = new_token(token.service_name, token.ip_address, token.login_server, split_at, token.expires_at, token.bandwidth, token.issuer, ctx);
-        token.expires_at = split_at;
-        transfer::public_transfer(token, ctx.sender());
-        transfer::public_transfer(remainder, ctx.sender());
+        transfer::public_transfer(split_time_internal(token, split_at, ctx), ctx.sender());
     }
 
     /// Fuse two tokens along the bandwidth axis.
